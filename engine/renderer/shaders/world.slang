@@ -54,21 +54,27 @@ static const uint RT_FLAG_REFLECTIONS = 2u;
 [[vk::binding(16, 0)]] Sampler2D<float4> rt_normal;   // prepass world normal (xyz), a = 1 on geometry
 [[vk::binding(17, 0)]] RaytracingAccelerationStructure scene_tlas;
 
-// Must match RtVertex / RtInstance in world_renderer.cpp (Vertex is 64 tightly packed bytes).
-struct RtVertex {
-    float3 position;
-    float3 normal;
-    float4 color; // rgb albedo, a material id
-    float2 uv;
-    float4 tangent;
-};
+// Must match RtInstanceGpu in world_renderer.cpp. Vertices are the C++ `Vertex` (64 tightly packed
+// bytes) read as floats: a struct view would put float3 normal at offset 12, which straddles a
+// 16-byte boundary and is invalid for PhysicalStorageBuffer blocks (VUID-...-pCode-08737).
+static const uint kRtVertexFloats = 16u; // position 0-2, normal 3-5, color 6-9, uv 10-11, tangent 12-15
 struct RtInstance {
-    RtVertex* vertices;
+    float* vertices;
     uint* indices;
     float4 albedo;   // rgb tint; a = 1: multiply by vertex colour (procedural materials)
     float4 emissive; // rgb radiance
 };
 [[vk::binding(18, 0)]] StructuredBuffer<RtInstance> rt_instances;
+
+float3 rt_vertex_normal(float* v, uint i) {
+    const uint b = i * kRtVertexFloats;
+    return float3(v[b + 3u], v[b + 4u], v[b + 5u]);
+}
+
+float4 rt_vertex_color(float* v, uint i) {
+    const uint b = i * kRtVertexFloats;
+    return float4(v[b + 6u], v[b + 7u], v[b + 8u], v[b + 9u]);
+}
 #endif
 
 // Must match ObjectPush in world_renderer.cpp (128 bytes). Procedural draws push only `model`.
@@ -1711,9 +1717,11 @@ RtHit rt_fetch_hit(uint instance, uint prim, float2 bary, float3x4 o2w, float3 o
     uint i1 = inst.indices[prim * 3u + 1u];
     uint i2 = inst.indices[prim * 3u + 2u];
     float w0 = 1.0 - bary.x - bary.y;
-    float3 n_obj = inst.vertices[i0].normal * w0 + inst.vertices[i1].normal * bary.x + inst.vertices[i2].normal * bary.y;
-    float4 c0 = inst.vertices[i0].color;
-    float3 col = c0.rgb * w0 + inst.vertices[i1].color.rgb * bary.x + inst.vertices[i2].color.rgb * bary.y;
+    float3 n_obj = rt_vertex_normal(inst.vertices, i0) * w0 + rt_vertex_normal(inst.vertices, i1) * bary.x +
+                   rt_vertex_normal(inst.vertices, i2) * bary.y;
+    float4 c0 = rt_vertex_color(inst.vertices, i0);
+    float3 col = c0.rgb * w0 + rt_vertex_color(inst.vertices, i1).rgb * bary.x +
+                 rt_vertex_color(inst.vertices, i2).rgb * bary.y;
 
     RtHit h;
     h.position = origin + dir * t;

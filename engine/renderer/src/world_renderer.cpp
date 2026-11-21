@@ -48,9 +48,9 @@ struct FrameData {
 };
 static_assert(sizeof(FrameData) == 192 + 16 * 16 + 64 + 3 * 16);
 
-// RT hit shading reads vertices through shader pointers (world.slang RtVertex / RtInstance).
+// RT hit shading reads vertices through shader pointers as floats (world.slang kRtVertexFloats).
 static_assert(sizeof(Vertex) == 64 && offsetof(Vertex, normal) == 12 && offsetof(Vertex, color) == 24,
-              "Vertex layout must match RtVertex in world.slang");
+              "Vertex layout must match kRtVertexFloats offsets in world.slang");
 struct RtInstanceGpu {
     u64 vertices;
     u64 indices;
