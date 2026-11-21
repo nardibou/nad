@@ -26,6 +26,7 @@ struct FrameData {
     float4 rt_params;      // x frame index, y sun angular radius (rad), z indirect intensity, w flags
     float4 rt_params2;     // x GI ray length (m), y AO radius (m), z history reset, w GI rays per pixel
     float4 rt_params3;     // x sun shadow ray length (m)
+    float4 taa;            // xy sub-pixel jitter (uv; subtract for the unjittered sample), z history valid, w TAA on
 };
 
 static const uint RT_FLAG_HYBRID_SHADOWS = 1u; // shadow_map holds casters missing from the TLAS
@@ -1557,6 +1558,109 @@ FullscreenOut postVS(uint id : SV_VertexID) {
     return fullscreen(id);
 }
 
+// ------------------------------------------------------------------ TAA (temporal anti-aliasing)
+// Jittered frames resolved into an HDR history: closest-depth dilated reprojection, Catmull-Rom
+// history fetch (keeps it sharp), YCoCg variance clipping (no ghost trails) and luma-weighted
+// blending (no firefly smearing). Binding 2 = current lit frame, 6 = previous history.
+
+float3 rgb_to_ycocg(float3 c) {
+    return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0.0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25)));
+}
+
+float3 ycocg_to_rgb(float3 c) {
+    return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+// 5-tap bicubic Catmull-Rom through bilinear taps (Jimenez / Karis).
+float3 history_catmull_rom(float2 uv) {
+    const float2 size = frame.screen.zw;
+    float2 pos = uv * size;
+    float2 c = floor(pos - 0.5) + 0.5;
+    float2 f = pos - c;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 t0 = (c - 1.0) / size;
+    float2 t3 = (c + 2.0) / size;
+    float2 t12 = (c + w2 / w12) / size;
+    float3 r = post_src.SampleLevel(float2(t12.x, t0.y), 0.0).rgb * (w12.x * w0.y) +
+               post_src.SampleLevel(float2(t0.x, t12.y), 0.0).rgb * (w0.x * w12.y) +
+               post_src.SampleLevel(t12, 0.0).rgb * (w12.x * w12.y) +
+               post_src.SampleLevel(float2(t3.x, t12.y), 0.0).rgb * (w3.x * w12.y) +
+               post_src.SampleLevel(float2(t12.x, t3.y), 0.0).rgb * (w12.x * w3.y);
+    float wsum = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return max(r / max(wsum, 1e-4), 0.0);
+}
+
+[shader("fragment")]
+float4 taaFS(FullscreenOut input) : SV_Target {
+    const int2 px = int2(input.position.xy);
+    const int2 size = int2(frame.screen.zw);
+    float3 cur = max(hdr_scene.Load(int3(px, 0)).rgb, 0.0);
+
+    // 3x3 neighbourhood: colour moments for clipping, closest depth for reprojection (sharp edges).
+    float3 m1 = float3(0.0, 0.0, 0.0);
+    float3 m2 = float3(0.0, 0.0, 0.0);
+    float closest = 1.0;
+    int2 closest_px = px;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            int2 p = clamp(px + int2(x, y), int2(0, 0), size - 1);
+            float3 s = rgb_to_ycocg(max(hdr_scene.Load(int3(p, 0)).rgb, 0.0));
+            m1 += s;
+            m2 += s * s;
+            float d = scene_depth.Load(int3(p, 0));
+            if (d < closest) {
+                closest = d;
+                closest_px = p;
+            }
+        }
+    }
+    m1 /= 9.0;
+    float3 sigma = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));
+
+    // Motion is taken from the closest-depth neighbour (dilation keeps foreground edges sharp) but
+    // applied to this pixel's own centre.
+    const float2 uv_unjit = (float2(closest_px) + 0.5) * frame.screen.xy - frame.taa.xy;
+    float view_t = closest < 0.99995 ? linear_depth(closest) : 1.0e5;
+    float3 world = screen_to_world(uv_unjit, view_t);
+    float4 prev_clip = mul(frame.prev_view_proj, float4(world, 1.0));
+    float2 motion = prev_clip.xy / max(prev_clip.w, 1e-4) * 0.5 + 0.5 - uv_unjit;
+    float2 prev_uv = (float2(px) + 0.5) * frame.screen.xy + motion;
+    float2 motion_px = motion * frame.screen.zw;
+    // The first-person viewmodel moves with the camera, so camera reprojection does not apply to it.
+    bool valid = frame.taa.z > 0.5 && prev_clip.w > 0.05 && all(prev_uv > 0.0) && all(prev_uv < 1.0) &&
+                 view_t > 0.6;
+    if (!valid) {
+        return float4(cur, 1.0);
+    }
+
+    float3 hist = rgb_to_ycocg(history_catmull_rom(prev_uv));
+    // Tighter box when moving: disocclusions resolve quickly; static views converge to full AA.
+    const float speed = length(motion_px);
+    const float gamma = lerp(1.25, 0.85, saturate(speed / 8.0));
+    float3 lo = m1 - sigma * gamma;
+    float3 hi = m1 + sigma * gamma;
+    float3 dir = hist - m1;
+    float3 ext = max(abs(hi - lo) * 0.5, 1e-5);
+    float3 unit = abs(dir / ext);
+    float ma = max(unit.x, max(unit.y, unit.z));
+    hist = ma > 1.0 ? m1 + dir / ma : hist;
+
+    float3 c = rgb_to_ycocg(cur);
+    float alpha = lerp(0.08, 0.2, saturate(speed / 12.0));
+    float wc = alpha / (1.0 + c.x);
+    float wh = (1.0 - alpha) / (1.0 + hist.x);
+    float3 res = ycocg_to_rgb((c * wc + hist * wh) / (wc + wh));
+    res = max(res, 0.0);
+    if (any(isnan(res)) || any(isinf(res))) {
+        res = cur;
+    }
+    return float4(res, 1.0);
+}
+
 [shader("fragment")]
 float4 postFS(FullscreenOut input) : SV_Target {
     const float2 uv = input.uv;
@@ -1576,7 +1680,8 @@ float4 postFS(FullscreenOut input) : SV_Target {
     float l_min = min(l_m, min(min(l_nw, l_ne), min(l_sw, l_se)));
     float l_max = max(l_m, max(max(l_nw, l_ne), max(l_sw, l_se)));
     float3 c = m;
-    if (l_max - l_min > max(0.0312, l_max * 0.125)) {
+    // TAA already resolved the edges; FXAA on top would only soften the image.
+    if (frame.taa.w < 0.5 && l_max - l_min > max(0.0312, l_max * 0.125)) {
         float2 dir = float2(-((l_nw + l_ne) - (l_sw + l_se)), (l_nw + l_sw) - (l_ne + l_se));
         float reduce = max((l_nw + l_ne + l_sw + l_se) * 0.03125, 1.0 / 128.0);
         float inv = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
@@ -1592,7 +1697,8 @@ float4 postFS(FullscreenOut input) : SV_Target {
         float3 mn = min(c, min(min(c_nw, c_ne), min(c_sw, c_se)));
         float3 mx = max(c, max(max(c_nw, c_ne), max(c_sw, c_se)));
         float3 amp = saturate(min(mn, 2.0 - mx) / max(mx, 1e-4));
-        float3 w = -sqrt(amp) * 0.14;
+        // Off under TAA: its Catmull-Rom history is already sharp and CAS would ring on resolved edges.
+        float3 w = -sqrt(amp) * (frame.taa.w > 0.5 ? 0.0 : 0.14);
         c = saturate((c + (c_nw + c_ne + c_sw + c_se) * w) / max(1.0 + 4.0 * w, 1e-4));
     }
 
@@ -1762,7 +1868,7 @@ RtPixel rt_pixel(int2 px) {
     float d = rt_depth.Load(int3(px, 0));
     o.valid = d < 0.99995;
     o.view_t = o.valid ? linear_depth(d) : 1e6;
-    float2 uv = (float2(px) + 0.5) * frame.screen.xy;
+    float2 uv = (float2(px) + 0.5) * frame.screen.xy - frame.taa.xy; // unjittered sample position
     o.p = screen_to_world(uv, o.view_t);
     float3 n = rt_normal.Load(int3(px, 0)).xyz;
     o.n = dot(n, n) > 1e-6 ? normalize(n) : float3(0.0, 1.0, 0.0);

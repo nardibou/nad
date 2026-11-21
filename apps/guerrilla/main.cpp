@@ -289,6 +289,7 @@ int main(int argc, char** argv) {
     bool start_hide_ui = false;
     bool force_village = false;
     bool no_rt = false;
+    bool no_taa = false;
     u32 rt_view = 0;
     bool has_cam_override = false;
     Vec3 cam_pos_override{0.5f, 0.0f, 9.0f};
@@ -341,6 +342,8 @@ int main(int argc, char** argv) {
             force_village = true;
         } else if (arg == "--no-rt") {
             no_rt = true; // raster lighting path even on ray-tracing GPUs (A/B comparisons)
+        } else if (arg == "--no-taa") {
+            no_taa = true; // FXAA instead of temporal anti-aliasing (A/B comparisons)
         } else if (arg == "--rt-view" && has_value) {
             parse_number(argv[++i], rt_view); // 1 shadow, 2 AO, 3 indirect light
         } else if (arg == "--cam" && i + 5 < argc) {
@@ -963,6 +966,7 @@ int main(int argc, char** argv) {
         // shadows it (the far peaks would otherwise eclipse it at this elevation).
         settings.rt_shadow_distance = studio.clay_scene ? 2000.0f : 120.0f;
         settings.ray_tracing = !no_rt;
+        settings.taa = !no_taa;
         settings.rt_debug_view = rt_view;
         {
             const Vec3 sun = math::normalize(settings.sun_direction);

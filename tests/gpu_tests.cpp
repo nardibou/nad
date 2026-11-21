@@ -199,6 +199,67 @@ TEST_CASE("gpu: world renderer casts sun shadows (ray traced and shadow map)") {
     CHECK(device->validation_error_count() == 0);
 }
 
+TEST_CASE("gpu: TAA converges on a static view and matches the unjittered image on flat areas") {
+    constexpr u32 kW = 96, kH = 96;
+    auto device = make_device(kW, kH);
+    REQUIRE(device);
+    {
+        renderer::WorldRenderer world(*device, 512);
+        REQUIRE(world.valid());
+        const math::Vec4 grey{0.5f, 0.5f, 0.5f, 15.0f};
+        renderer::MeshData ground, box;
+        renderer::append(ground, renderer::make_plane(20.0f), math::Mat4::identity(), grey);
+        renderer::append(box, renderer::make_cube(1.0f), math::translate({0, 1.0f, 0}), grey);
+        const renderer::WorldDrawItem items[] = {{world.upload(ground)}, {world.upload(box)}};
+        renderer::Camera camera;
+        camera.position = {4, 5, 6};
+        camera.target = {0, 0.5f, 0};
+        renderer::WorldSettings settings;
+        settings.fog_density = 0.0f;
+        settings.shadow_radius = 8.0f;
+        settings.ray_tracing = false; // isolate TAA from RT accumulation
+
+        auto frame = [&](bool taa, int count) {
+            settings.taa = taa;
+            for (int i = 0; i < count; ++i) {
+                REQUIRE(world.render_frame(camera, settings, items));
+            }
+            std::vector<u8> rgba;
+            REQUIRE(device->read_back(rgba));
+            return rgba;
+        };
+        const auto plain = frame(false, 2);
+        const auto a = frame(true, 40);
+        const auto b = frame(true, 1);
+        int max_step = 0;
+        int flat_err = 0;
+        int flat_px = 0;
+        for (u32 y = 1; y + 1 < kH; ++y) {
+            for (u32 x = 1; x + 1 < kW; ++x) {
+                const usize i = (static_cast<usize>(y) * kW + x) * 4;
+                max_step = std::max(max_step, std::abs(int(a[i + 1]) - int(b[i + 1])));
+                // Flat pixel: its 3x3 neighbourhood in the plain frame is uniform (no edge).
+                bool flat = true;
+                for (int dy = -1; dy <= 1 && flat; ++dy) {
+                    for (int dx = -1; dx <= 1 && flat; ++dx) {
+                        const usize j = ((static_cast<usize>(y) + dy) * kW + x + dx) * 4;
+                        flat = std::abs(int(plain[j + 1]) - int(plain[i + 1])) <= 2;
+                    }
+                }
+                if (flat) {
+                    flat_err = std::max(flat_err, std::abs(int(a[i + 1]) - int(plain[i + 1])));
+                    ++flat_px;
+                }
+            }
+        }
+        INFO("max frame-to-frame step " << max_step << ", max flat-area error " << flat_err);
+        CHECK(flat_px > 1000);
+        CHECK(flat_err <= 4);  // no colour drift or reprojection shift on surfaces
+        CHECK(max_step <= 12); // converged: one jittered frame moves the resolve only slightly
+    }
+    CHECK(device->validation_error_count() == 0);
+}
+
 TEST_CASE("gpu: buffers can be created, updated and destroyed") {
     auto device = make_device();
     REQUIRE(device);
