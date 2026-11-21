@@ -48,7 +48,8 @@ inline f32 rand01(u32 seed) noexcept {
 }
 
 inline Vec4 clay_col(f32 lum = 0.75f, f32 warm = 0.0f) noexcept {
-    return renderer::material_color(Material::Clay, {lum + warm * 0.015f, lum - 0.015f, lum - 0.032f - warm * 0.01f});
+    // Sun-baked sand clay (warm greybox look of the art-direction reference).
+    return renderer::material_color(Material::Clay, {lum * 1.0f + warm * 0.015f, lum * 0.86f, lum * 0.70f - warm * 0.01f});
 }
 
 // Smooth organic puddle basin depression query (returns depth <= 0.0 in meters)

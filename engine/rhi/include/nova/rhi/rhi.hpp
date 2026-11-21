@@ -27,8 +27,11 @@ using BufferHandle = Handle<struct BufferTag>;
 using ShaderHandle = Handle<struct ShaderTag>;
 using PipelineHandle = Handle<struct PipelineTag>;
 using TextureHandle = Handle<struct TextureTag>;
+using BlasHandle = Handle<struct BlasTag>; // bottom-level acceleration structure (one mesh)
+using TlasHandle = Handle<struct TlasTag>; // top-level acceleration structure (scene instances)
 
-enum class BufferUsage : u8 { Vertex, Index, Uniform };
+// Storage: read-only shader storage buffer (std430), host-written like the other buffer kinds.
+enum class BufferUsage : u8 { Vertex, Index, Uniform, Storage };
 enum class ShaderStage : u8 { Vertex, Fragment };
 enum class VertexFormat : u8 { Float2, Float3, Float4 };
 enum class CullMode : u8 { None, Back };
@@ -59,7 +62,8 @@ struct TextureDesc {
     bool mipmaps = false;
 };
 
-enum class BindingType : u8 { UniformBuffer, SampledTexture };
+// AccelerationStructure and StorageBuffer require DeviceInfo::ray_tracing / are fragment-visible.
+enum class BindingType : u8 { UniformBuffer, SampledTexture, StorageBuffer, AccelerationStructure };
 
 // One descriptor in set 0, visible to vertex and fragment stages.
 struct BindingDesc {
@@ -71,8 +75,26 @@ struct BindingDesc {
 // Value for one BindingDesc at draw time.
 struct ResourceBinding {
     u32 binding = 0;
-    BufferHandle buffer;   // UniformBuffer
+    BufferHandle buffer;   // UniformBuffer, StorageBuffer
     TextureHandle texture; // SampledTexture
+    TlasHandle tlas;       // AccelerationStructure
+};
+
+// Triangle geometry for a BLAS: positions are Float3 at offset 0 of each `vertex_stride` vertex,
+// indices are u32. The buffers must stay alive (and unchanged) while the BLAS is in use.
+struct BlasDesc {
+    BufferHandle vertices;
+    u32 vertex_count = 0;
+    u32 vertex_stride = 0;
+    BufferHandle indices;
+    u32 index_count = 0;
+};
+
+struct TlasInstance {
+    BlasHandle blas;
+    f32 transform[3][4]{}; // row-major 3x4 object-to-world
+    u32 custom_index = 0;  // 24 bits, visible to shaders as the instance id
+    u8 mask = 0xFF;
 };
 
 struct BufferDesc {
@@ -150,6 +172,10 @@ public:
     virtual void push_constants(const void* data, u32 size) = 0;
     virtual void draw(u32 vertex_count, u32 first_vertex = 0) = 0;
     virtual void draw_indexed(u32 index_count, u32 first_index = 0, i32 vertex_offset = 0) = 0;
+
+    // Ray tracing (DeviceInfo::ray_tracing). Outside render passes only. Rebuilds `tlas` from
+    // `instances` (<= its capacity); later passes in this frame may trace against it.
+    virtual void build_tlas(TlasHandle tlas, std::span<const TlasInstance> instances) = 0;
 };
 
 struct DeviceDesc {
@@ -159,6 +185,7 @@ struct DeviceDesc {
     u32 height = 720;
     bool vsync = true;
     bool validation = false; // Vulkan validation layers + debug messenger, if installed
+    bool ray_tracing = true; // use hardware ray queries when available (NOVA_NO_RT=1 also disables)
 };
 
 struct DeviceInfo {
@@ -168,6 +195,7 @@ struct DeviceInfo {
     bool software = false;  // CPU implementation (e.g. lavapipe)
     bool validation = false;
     bool gpu_timing = false; // timestamp queries supported
+    bool ray_tracing = false; // acceleration structures + inline ray queries in fragment shaders
 };
 
 struct Extent {
@@ -195,6 +223,14 @@ public:
     virtual void destroy(ShaderHandle handle) = 0;
     virtual void destroy(PipelineHandle handle) = 0;
     virtual void destroy(TextureHandle handle) = 0;
+
+    // Ray tracing (DeviceInfo::ray_tracing); invalid handles / 0 otherwise. BLAS builds complete
+    // before returning (outside begin_frame/end_frame). Buffer addresses are for shader pointers.
+    [[nodiscard]] virtual BlasHandle create_blas(const BlasDesc& desc) = 0;
+    [[nodiscard]] virtual TlasHandle create_tlas(u32 max_instances) = 0;
+    [[nodiscard]] virtual u64 buffer_address(BufferHandle buffer) = 0;
+    virtual void destroy(BlasHandle handle) = 0;
+    virtual void destroy(TlasHandle handle) = 0;
 
     // Frames the CPU may record ahead of the GPU; per-frame buffers need this many copies.
     [[nodiscard]] virtual u32 frames_in_flight() const noexcept = 0;

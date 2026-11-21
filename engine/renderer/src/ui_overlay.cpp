@@ -287,7 +287,7 @@ void UiOverlay::circle_filled(f32 cx, f32 cy, f32 r, const math::Vec4& col, int 
     const u32 center = static_cast<u32>(vertices_.size());
     vertices_.push_back({cx, cy, 0.5f, 0.5f, col.x, col.y, col.z, col.w});
     for (int i = 0; i < segments; ++i) {
-        const f32 a = (static_cast<f32>(i) / segments) * 2.0f * math::kPi;
+        const f32 a = (static_cast<f32>(i) / static_cast<f32>(segments)) * 2.0f * math::kPi;
         vertices_.push_back({cx + std::cos(a) * r, cy + std::sin(a) * r, 0.5f, 0.5f, col.x, col.y, col.z, col.w});
     }
     for (int i = 0; i < segments; ++i) {
@@ -304,7 +304,7 @@ void UiOverlay::circle_outline(f32 cx, f32 cy, f32 r, f32 thickness, const math:
     const f32 r1 = r + thickness * 0.5f;
     const u32 base = static_cast<u32>(vertices_.size());
     for (int i = 0; i < segments; ++i) {
-        const f32 a = (static_cast<f32>(i) / segments) * 2.0f * math::kPi;
+        const f32 a = (static_cast<f32>(i) / static_cast<f32>(segments)) * 2.0f * math::kPi;
         const f32 ca = std::cos(a), sa = std::sin(a);
         vertices_.push_back({cx + ca * r1, cy + sa * r1, 0.5f, 0.5f, col.x, col.y, col.z, col.w});
         vertices_.push_back({cx + ca * r0, cy + sa * r0, 0.5f, 0.5f, col.x, col.y, col.z, col.w});

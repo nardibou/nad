@@ -22,7 +22,14 @@ struct FrameData {
     float4 point_light;    // xyz position, w range (m)
     float4 point_color;    // rgb radiance (0 = off), w crosshair arm length (px, 0 = off)
     float4 output_size;    // xy back-buffer pixels
+    float4x4 prev_view_proj; // last frame's view_proj (RT temporal reprojection)
+    float4 rt_params;      // x frame index, y sun angular radius (rad), z indirect intensity, w flags
+    float4 rt_params2;     // x GI ray length (m), y AO radius (m), z history reset, w GI rays per pixel
+    float4 rt_params3;     // x sun shadow ray length (m)
 };
+
+static const uint RT_FLAG_HYBRID_SHADOWS = 1u; // shadow_map holds casters missing from the TLAS
+static const uint RT_FLAG_REFLECTIONS = 2u;
 
 [[vk::binding(0, 0)]] ConstantBuffer<FrameData> frame;
 [[vk::binding(1, 0)]] Sampler2D<float> shadow_map;
@@ -37,6 +44,32 @@ struct FrameData {
 [[vk::binding(9, 0)]] Sampler2D<float4> normal_tex;             // tangent space
 [[vk::binding(10, 0)]] Sampler2D<float4> occlusion_tex;         // R
 [[vk::binding(11, 0)]] Sampler2D<float4> emissive_tex;          // sRGB
+
+#ifdef NOVA_RT
+// NOVA Lumina RT: hybrid ray-traced lighting (compiled only into world_rt.spv, see WorldRenderer).
+[[vk::binding(12, 0)]] Sampler2D<float4> rt_a;        // denoised visibility: r sun shadow, g AO / generic input
+[[vk::binding(13, 0)]] Sampler2D<float4> rt_b;        // denoised indirect radiance / generic history
+[[vk::binding(14, 0)]] Sampler2D<float> rt_depth;     // this frame's prepass depth
+[[vk::binding(15, 0)]] Sampler2D<float> rt_prev_depth; // last frame's prepass depth
+[[vk::binding(16, 0)]] Sampler2D<float4> rt_normal;   // prepass world normal (xyz), a = 1 on geometry
+[[vk::binding(17, 0)]] RaytracingAccelerationStructure scene_tlas;
+
+// Must match RtVertex / RtInstance in world_renderer.cpp (Vertex is 64 tightly packed bytes).
+struct RtVertex {
+    float3 position;
+    float3 normal;
+    float4 color; // rgb albedo, a material id
+    float2 uv;
+    float4 tangent;
+};
+struct RtInstance {
+    RtVertex* vertices;
+    uint* indices;
+    float4 albedo;   // rgb tint; a = 1: multiply by vertex colour (procedural materials)
+    float4 emissive; // rgb radiance
+};
+[[vk::binding(18, 0)]] StructuredBuffer<RtInstance> rt_instances;
+#endif
 
 // Must match ObjectPush in world_renderer.cpp (128 bytes). Procedural draws push only `model`.
 struct ObjectData {
@@ -705,7 +738,23 @@ float3 light_surface(Surface s, float3 p, float3 geom_n, float2 pixel_pos) {
     // Strictly clamped to [1e-4, 1.0] so (1.0 - ndv) is NEVER negative (eliminates GPU NaN black dots!)
     float ndv = clamp(dot(n, v), 1e-4, 1.0);
     float vdh = saturate(dot(v, h));
+#ifdef NOVA_RT
+    // Ray-traced, temporally accumulated and denoised visibility (same resolution as this pass).
+    const float4 rt_vis = rt_a.Load(int3(int2(pixel_pos), 0));
+    float shadow = rt_vis.r;
+    if ((asuint(frame.rt_params.w) & RT_FLAG_HYBRID_SHADOWS) != 0u) {
+        shadow *= sample_shadow(p, geom_n, pixel_pos); // skinned / alpha-tested casters outside the TLAS
+    }
+    const uint debug_view = (asuint(frame.rt_params.w) >> 2u) & 3u; // 1 shadow, 2 AO, 3 indirect
+    if (debug_view != 0u) {
+        float3 dbg = debug_view == 1u ? rt_vis.rrr
+                   : debug_view == 2u ? rt_vis.ggg
+                                      : rt_b.Load(int3(int2(pixel_pos), 0)).rgb;
+        return dbg / max(frame.camera_forward.w, 1e-3); // undo exposure so 1.0 reads as white
+    }
+#else
     float shadow = sample_shadow(p, geom_n, pixel_pos);
+#endif
     // Smooth grazing shadow terminator removes faceted self-shadow waves on curved shoulders, cloth & beveled blocks
     float terminator = smoothstep(0.015, 0.095, geom_ndl);
 
@@ -727,7 +776,15 @@ float3 light_surface(Surface s, float3 p, float3 geom_n, float2 pixel_pos) {
                       ground_amb * (dn_w * 0.92 + hor_w * 0.22);
     float3 ambient = hemi_ibl * frame.ground_color.w;
 
+#ifdef NOVA_RT
+    // Path-traced one-bounce irradiance (sky + coloured bounce, occlusion included) replaces the
+    // hemisphere guess; keep a little of it so normal-mapped detail still reads in deep shade.
+    const float3 rt_gi = max(rt_b.Load(int3(int2(pixel_pos), 0)).rgb, 0.0) * frame.rt_params.z;
+    ambient = rt_gi + hemi_ibl * frame.ground_color.w * 0.06;
+    float ao = saturate(s.occlusion * rt_vis.g);
+#else
     float ao = saturate(s.occlusion * contact_ao(p, geom_n));
+#endif
     float3 diffuse_albedo = s.albedo * (1.0 - s.metallic);
     float3 f0 = lerp(float3(0.04, 0.04, 0.04), s.albedo, s.metallic);
 
@@ -1558,3 +1615,504 @@ float4 postFS(FullscreenOut input) : SV_Target {
     c += noise / 255.0;
     return float4(c, 1.0);
 }
+
+// ================================================================== NOVA Lumina RT (hybrid ray tracing)
+//
+// Pipeline (WorldRenderer::render_frame, RT devices): normal/depth prepass -> sun-shadow + AO rays ->
+// one-bounce GI rays -> per-signal temporal accumulation (depth-validated reprojection + neighbourhood
+// clamp) -> penumbra-aware spatial denoise -> forward shading reads the results per pixel.
+// Reflections on water trace the TLAS and reuse on-screen radiance when the hit is visible.
+#ifdef NOVA_RT
+
+static const float kPi = 3.14159265;
+
+int2 rt_clamp_px(int2 px) {
+    return clamp(px, int2(0, 0), int2(frame.screen.zw) - 1);
+}
+
+// Per-pixel, per-frame decorrelated [0,1)^2: IGN spatial pattern + golden-ratio temporal scramble.
+float2 rt_rand2(float2 pixel, float salt) {
+    const float f = frame.rt_params.x;
+    float a = ign(pixel + float2(salt * 37.0, salt * 11.0));
+    float b = ign(pixel.yx + float2(salt * 19.0 + 47.0, salt * 29.0 + 13.0));
+    return frac(float2(a, b) + float2(0.61803399, 0.75487767) * (f + salt * 7.0));
+}
+
+// Orthonormal basis around n (Duff et al. 2017).
+void rt_basis(float3 n, out float3 t, out float3 b) {
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float c = n.x * n.y * a;
+    t = float3(1.0 + s * n.x * n.x * a, s * c, -s * n.x);
+    b = float3(c, s + n.y * n.y * a, -n.y);
+}
+
+float3 rt_cosine_dir(float3 n, float2 u) {
+    float3 t, b;
+    rt_basis(n, t, b);
+    float r = sqrt(u.x);
+    float phi = 2.0 * kPi * u.y;
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u.x, 0.0)));
+}
+
+// Direction inside the solar disc: soft shadows get their physically correct, contact-hardening penumbra.
+float3 rt_sun_dir(float2 u) {
+    float3 s = frame.sun_dir.xyz;
+    float3 t, b;
+    rt_basis(s, t, b);
+    float r = sqrt(u.x) * tan(frame.rt_params.y);
+    float phi = 2.0 * kPi * u.y;
+    return normalize(s + (t * cos(phi) + b * sin(phi)) * r);
+}
+
+float rt_visible(float3 origin, float3 dir, float tmax) {
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = dir;
+    ray.TMin = 0.0;
+    ray.TMax = tmax;
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> q;
+    q.TraceRayInline(scene_tlas, 0, 0xFF, ray);
+    q.Proceed();
+    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
+}
+
+// Diffuse sky light arriving along `dir` (no sun disc: it is sampled explicitly, so no fireflies).
+float3 rt_sky_radiance(float3 dir) {
+    float3 sky;
+    if (dir.y >= 0.0) {
+        sky = lerp(frame.sky_horizon.rgb, frame.sky_zenith.rgb, sqrt(dir.y));
+        sky += frame.sun_color.rgb * 0.05 * pow(saturate(dot(dir, frame.sun_dir.xyz)), 6.0);
+    } else {
+        float3 sky_amb = lerp(frame.sky_horizon.rgb, frame.sky_zenith.rgb, 0.35);
+        sky = frame.ground_color.rgb * (sky_amb * 0.6 + frame.sun_color.rgb * 0.35 * saturate(frame.sun_dir.y));
+    }
+    return sky * frame.ground_color.w;
+}
+
+float3 rt_sky_irradiance(float3 n) {
+    float3 up = lerp(frame.sky_horizon.rgb, frame.sky_zenith.rgb, 0.5);
+    float3 sky_amb = lerp(frame.sky_horizon.rgb, frame.sky_zenith.rgb, 0.35);
+    float3 down = frame.ground_color.rgb * (sky_amb * 0.6 + frame.sun_color.rgb * 0.5 * saturate(frame.sun_dir.y));
+    return lerp(down, up, n.y * 0.5 + 0.5) * frame.ground_color.w;
+}
+
+struct RtHit {
+    float3 position;
+    float3 normal;
+    float3 albedo;
+    float3 emissive;
+    int material;
+};
+
+RtHit rt_fetch_hit(uint instance, uint prim, float2 bary, float3x4 o2w, float3 origin, float3 dir, float t) {
+    RtInstance inst = rt_instances[instance];
+    uint i0 = inst.indices[prim * 3u];
+    uint i1 = inst.indices[prim * 3u + 1u];
+    uint i2 = inst.indices[prim * 3u + 2u];
+    float w0 = 1.0 - bary.x - bary.y;
+    float3 n_obj = inst.vertices[i0].normal * w0 + inst.vertices[i1].normal * bary.x + inst.vertices[i2].normal * bary.y;
+    float4 c0 = inst.vertices[i0].color;
+    float3 col = c0.rgb * w0 + inst.vertices[i1].color.rgb * bary.x + inst.vertices[i2].color.rgb * bary.y;
+
+    RtHit h;
+    h.position = origin + dir * t;
+    float3 n = mul((float3x3)o2w, n_obj);
+    n = dot(n, n) > 1e-10 ? normalize(n) : -dir;
+    h.normal = dot(n, dir) > 0.0 ? -n : n; // two-sided
+    h.material = inst.albedo.a > 0.5 ? int(c0.a + 0.5) : -1;
+    h.albedo = saturate(inst.albedo.a > 0.5 ? col * inst.albedo.rgb : inst.albedo.rgb);
+    h.emissive = inst.emissive.rgb;
+    if (h.material == MAT_WATER) {
+        h.albedo *= 0.25;
+    } else if (h.material == MAT_EMISSIVE) {
+        h.emissive += col * kEmissiveScale;
+    }
+    return h;
+}
+
+// Outgoing radiance at a ray hit: sun with a traced shadow ray + diffuse sky (the second bounce's stand-in).
+float3 rt_shade_hit(RtHit h, float2 u) {
+    float ndl = saturate(dot(h.normal, frame.sun_dir.xyz));
+    float vis = 0.0;
+    if (ndl > 0.0) {
+        vis = rt_visible(h.position + h.normal * 0.02, rt_sun_dir(u), frame.rt_params3.x);
+    }
+    return h.albedo * (frame.sun_color.rgb * ndl * vis + rt_sky_irradiance(h.normal)) + h.emissive;
+}
+
+struct RtPixel {
+    bool valid;
+    float3 p;
+    float3 n;
+    float view_t;
+};
+
+RtPixel rt_pixel(int2 px) {
+    RtPixel o;
+    px = rt_clamp_px(px);
+    float d = rt_depth.Load(int3(px, 0));
+    o.valid = d < 0.99995;
+    o.view_t = o.valid ? linear_depth(d) : 1e6;
+    float2 uv = (float2(px) + 0.5) * frame.screen.xy;
+    o.p = screen_to_world(uv, o.view_t);
+    float3 n = rt_normal.Load(int3(px, 0)).xyz;
+    o.n = dot(n, n) > 1e-6 ? normalize(n) : float3(0.0, 1.0, 0.0);
+    return o;
+}
+
+float rt_px_per_metre(float view_t) {
+    return frame.screen.w / max(2.0 * view_t * frame.camera_up.w, 1e-4);
+}
+
+// ---- prepass: world normal (+ depth) for ray origins, reprojection and denoiser edge stops
+
+// Shading normal moved into the hemisphere of the viewer-facing geometric normal. Robust both to
+// two-sided meshes whose winding disagrees with their normals (cloth) and to smooth normals that
+// tilt away from the camera near silhouettes (a camera-facing test alone would flip those).
+float3 rt_visible_normal(float3 n, float3 world_pos, bool front_face) {
+    float3 ng = cross(ddx(world_pos), ddy(world_pos));
+    if (dot(ng, ng) < 1e-14) {
+        return front_face ? n : -n;
+    }
+    ng = normalize(ng);
+    if (dot(ng, frame.camera_pos.xyz - world_pos) < 0.0) {
+        ng = -ng;
+    }
+    return dot(n, ng) >= 0.0 ? n : -n;
+}
+
+float3 rt_prepass_normal(VSOutput input) {
+    return dot(input.normal, input.normal) > 1e-10 ? normalize(input.normal) : float3(0.0, 1.0, 0.0);
+}
+
+void rt_prepass_alpha_test(VSOutput input) {
+    if (object.material.z > 0.0) {
+        float2 uv_off = unpack_u16_pair(object.uv_xform.z, -8.0, 8.0, -8.0, 8.0);
+        float uv_rot = unpack_u16_pair(object.uv_xform.w, -3.14159265, 3.14159265, 0.0, 0.15).x;
+        float2 uvc = input.uv - 0.5;
+        float2 uv = float2(uvc.x * cos(uv_rot) - uvc.y * sin(uv_rot), uvc.x * sin(uv_rot) + uvc.y * cos(uv_rot)) + 0.5;
+        uv = uv * object.uv_xform.xy + uv_off;
+        if (base_color_tex.Sample(uv).a * object.base_color.a < object.material.z) {
+            discard;
+        }
+    }
+}
+
+// One-sided meshes keep exactly the normal the forward pass shades with (front_face flip included),
+// so ray-traced visibility always agrees with direct lighting, even on meshes with inverted normals.
+[shader("fragment")]
+float4 rtPrepassFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
+    float3 n = rt_prepass_normal(input);
+    return float4(front_face ? n : -n, 1.0);
+}
+
+[shader("fragment")]
+float4 rtPrepassTwoSidedFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
+    return float4(rt_visible_normal(rt_prepass_normal(input), input.world_pos, front_face), 1.0);
+}
+
+[shader("fragment")]
+float4 rtPrepassAssetFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
+    rt_prepass_alpha_test(input);
+    float3 n = rt_prepass_normal(input);
+    return float4(front_face ? n : -n, 1.0);
+}
+
+[shader("fragment")]
+float4 rtPrepassAssetTwoSidedFS(VSOutput input, bool front_face : SV_IsFrontFace) : SV_Target {
+    rt_prepass_alpha_test(input);
+    return float4(rt_visible_normal(rt_prepass_normal(input), input.world_pos, front_face), 1.0);
+}
+
+// ---- trace 1: sun shadow (closest hit -> blocker distance for the penumbra-aware denoiser) + short AO
+
+[shader("fragment")]
+float4 rtShadowFS(FullscreenOut input) : SV_Target {
+    const int2 px = int2(input.position.xy);
+    RtPixel g = rt_pixel(px);
+    if (!g.valid) {
+        return float4(1.0, 1.0, 0.0, 1.0);
+    }
+    const float3 origin = g.p + g.n * (0.012 + 0.0015 * g.view_t);
+
+    float shadow = 0.0;
+    float blocker = 0.0;
+    {
+        // Thin two-sided surfaces (cloth, leaves) are sun-lit through translucency even when facing
+        // away: start the ray on the sun side. Closed solids still self-occlude correctly.
+        const float3 n_sun = dot(g.n, frame.sun_dir.xyz) >= 0.0 ? g.n : -g.n;
+        RayDesc ray;
+        ray.Origin = g.p + n_sun * (0.012 + 0.0015 * g.view_t);
+        ray.Direction = rt_sun_dir(rt_rand2(input.position.xy, 0.0));
+        ray.TMin = 0.0;
+        ray.TMax = frame.rt_params3.x;
+        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> q;
+        q.TraceRayInline(scene_tlas, 0, 0xFF, ray);
+        while (q.Proceed()) {}
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            blocker = q.CommittedRayT();
+        } else {
+            shadow = 1.0;
+        }
+    }
+
+    // Short-range AO: real geometry, so no screen-space halos or off-screen occluder loss.
+    const float ao_r = max(frame.rt_params2.y, 0.05);
+    RayDesc ao_ray;
+    ao_ray.Origin = origin;
+    ao_ray.Direction = rt_cosine_dir(g.n, rt_rand2(input.position.xy, 1.0));
+    ao_ray.TMin = 0.0;
+    ao_ray.TMax = ao_r;
+    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER> qa;
+    qa.TraceRayInline(scene_tlas, 0, 0xFF, ao_ray);
+    while (qa.Proceed()) {}
+    float ao = 1.0;
+    if (qa.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        float x = saturate(qa.CommittedRayT() / ao_r);
+        ao = x * x * (3.0 - 2.0 * x);
+    }
+    return float4(shadow, ao, blocker, 1.0);
+}
+
+// ---- trace 2: one-bounce diffuse GI (cosine rays, hit shading with its own sun shadow ray)
+
+[shader("fragment")]
+float4 rtGiFS(FullscreenOut input) : SV_Target {
+    const int2 px = int2(input.position.xy);
+    RtPixel g = rt_pixel(px);
+    if (!g.valid) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    const float3 origin = g.p + g.n * (0.012 + 0.0015 * g.view_t);
+    const int rays = clamp(int(frame.rt_params2.w + 0.5), 1, 4);
+    float3 sum = float3(0.0, 0.0, 0.0);
+    for (int i = 0; i < rays; ++i) {
+        RayDesc ray;
+        ray.Origin = origin;
+        ray.Direction = rt_cosine_dir(g.n, rt_rand2(input.position.xy, 2.0 + float(i) * 2.0));
+        ray.TMin = 0.0;
+        ray.TMax = max(frame.rt_params2.x, 0.5);
+        RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+        q.TraceRayInline(scene_tlas, 0, 0xFF, ray);
+        while (q.Proceed()) {}
+        float3 l;
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            RtHit h = rt_fetch_hit(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(),
+                                   q.CommittedTriangleBarycentrics(), q.CommittedObjectToWorld3x4(), ray.Origin,
+                                   ray.Direction, q.CommittedRayT());
+            l = rt_shade_hit(h, rt_rand2(input.position.xy, 3.0 + float(i) * 2.0));
+        } else {
+            l = rt_sky_radiance(ray.Direction);
+        }
+        // Firefly clamp: a single bright bounce must not dominate the 1-ray estimate.
+        float lum = dot(l, float3(0.2126, 0.7152, 0.0722));
+        sum += l * (min(lum, 6.0) / max(lum, 1e-4));
+    }
+    return float4(sum / float(rays), 1.0);
+}
+
+// ---- temporal accumulation: depth-validated reprojection + neighbourhood clamp (no ghost trails)
+// Input: raw signal at binding 12, previous history at 13. Output: xyz signal, w = history length.
+
+float4 rt_temporal(float2 pixel, float max_history) {
+    const int2 px = int2(pixel);
+    float4 cur = rt_a.Load(int3(px, 0));
+    RtPixel g = rt_pixel(px);
+    if (!g.valid) {
+        return float4(cur.xyz, 1.0);
+    }
+    float3 mn = cur.xyz;
+    float3 mx = cur.xyz;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            float3 s = rt_a.Load(int3(rt_clamp_px(px + int2(x, y)), 0)).xyz;
+            mn = min(mn, s);
+            mx = max(mx, s);
+        }
+    }
+    float4 clip = mul(frame.prev_view_proj, float4(g.p, 1.0));
+    bool valid = frame.rt_params2.z < 0.5 && clip.w > 0.05;
+    float2 prev_uv = clip.xy / max(clip.w, 1e-4) * 0.5 + 0.5;
+    valid = valid && all(prev_uv > 0.0) && all(prev_uv < 1.0);
+    float4 hist = float4(cur.xyz, 0.0);
+    if (valid) {
+        float prev_t = linear_depth(rt_prev_depth.SampleLevel(prev_uv, 0.0));
+        valid = abs(prev_t - clip.w) < 0.035 * clip.w + 0.03;
+        hist = rt_b.SampleLevel(prev_uv, 0.0);
+    }
+    float count = valid ? min(hist.w + 1.0, max_history) : 1.0;
+    float3 h = clamp(hist.xyz, mn, mx);
+    return float4(lerp(h, cur.xyz, 1.0 / count), count);
+}
+
+[shader("fragment")]
+float4 rtTemporalShadowFS(FullscreenOut input) : SV_Target {
+    return rt_temporal(input.position.xy, 24.0);
+}
+
+[shader("fragment")]
+float4 rtTemporalGiFS(FullscreenOut input) : SV_Target {
+    return rt_temporal(input.position.xy, 48.0);
+}
+
+// ---- spatial denoise (geometry-aware Vogel disc). Shadows: kernel = projected penumbra width,
+// derived from blocker distance and the solar disc, so contact shadows stay razor sharp.
+
+static const int kRtTaps = 12;
+
+float2 rt_vogel(int i, float rot) {
+    float r = sqrt((float(i) + 0.5) / float(kRtTaps));
+    float a = float(i) * 2.39996323 + rot;
+    return float2(cos(a), sin(a)) * r;
+}
+
+float rt_geom_weight(RtPixel c, RtPixel t) {
+    if (!t.valid) {
+        return 0.0;
+    }
+    float plane = abs(dot(t.p - c.p, c.n));
+    float w_z = saturate(1.0 - plane / (0.03 + 0.012 * c.view_t));
+    float w_n = pow(saturate(dot(c.n, t.n)), 16.0);
+    return w_z * w_n;
+}
+
+[shader("fragment")]
+float4 rtDenoiseShadowFS(FullscreenOut input) : SV_Target {
+    const int2 px = int2(input.position.xy);
+    float4 center = rt_a.Load(int3(px, 0));
+    RtPixel g = rt_pixel(px);
+    if (!g.valid) {
+        return center;
+    }
+    const float ppm = rt_px_per_metre(g.view_t);
+    const float conf = saturate(center.w / 24.0);
+    float penumbra_m = center.z * tan(frame.rt_params.y) * 2.0;
+    float r_shadow = clamp(penumbra_m * ppm, 0.0, 16.0) * lerp(1.0, 0.55, conf) + 1.0;
+    float r_ao = clamp(0.3 * ppm, 2.0, 10.0) * lerp(1.0, 0.6, conf);
+    float rot = ign(input.position.xy) * 6.2831853;
+
+    float s_sum = center.x, s_w = 1.0;
+    float a_sum = center.y, a_w = 1.0;
+    float b_sum = center.z, b_w = 1.0;
+    for (int i = 0; i < kRtTaps; ++i) {
+        float2 o = rt_vogel(i, rot);
+        int2 ps = rt_clamp_px(px + int2(round(o * r_shadow)));
+        float w = rt_geom_weight(g, rt_pixel(ps));
+        float4 s = rt_a.Load(int3(ps, 0));
+        s_sum += s.x * w;
+        s_w += w;
+        // Blockers only blur with blockers so lit/unlit boundaries keep their width estimate.
+        float wb = w * (s.z > 0.0 ? 1.0 : 0.0);
+        b_sum += s.z * wb;
+        b_w += wb;
+
+        int2 pa = rt_clamp_px(px + int2(round(o * r_ao)));
+        float wa = rt_geom_weight(g, rt_pixel(pa));
+        a_sum += rt_a.Load(int3(pa, 0)).y * wa;
+        a_w += wa;
+    }
+    return float4(s_sum / s_w, a_sum / a_w, b_sum / b_w, center.w);
+}
+
+// Edge-aware 5x5 a-trous wavelet pass (SVGF-style, geometry stops only: GI is low frequency).
+// Two passes with growing stride cover ~20 px while every tap stays on the same surface.
+float4 rt_atrous_gi(int2 px, float stride) {
+    float4 center = rt_a.Load(int3(px, 0));
+    RtPixel g = rt_pixel(px);
+    if (!g.valid) {
+        return center;
+    }
+    const float conf = saturate(center.w / 48.0);
+    const float step = stride * max(1.0, frame.screen.w / 720.0) * lerp(1.0, 0.6, conf);
+    const float k[3] = {0.375, 0.25, 0.0625};
+    float3 sum = center.xyz * (k[0] * k[0]);
+    float wsum = k[0] * k[0];
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            if (x == 0 && y == 0) {
+                continue;
+            }
+            int2 ps = rt_clamp_px(px + int2(round(float2(float(x), float(y)) * step)));
+            float w = k[abs(x)] * k[abs(y)] * rt_geom_weight(g, rt_pixel(ps));
+            sum += rt_a.Load(int3(ps, 0)).xyz * w;
+            wsum += w;
+        }
+    }
+    return float4(sum / wsum, center.w);
+}
+
+[shader("fragment")]
+float4 rtDenoiseGiFS(FullscreenOut input) : SV_Target {
+    return rt_atrous_gi(int2(input.position.xy), 1.5);
+}
+
+[shader("fragment")]
+float4 rtDenoiseGi2FS(FullscreenOut input) : SV_Target {
+    return rt_atrous_gi(int2(input.position.xy), 4.0);
+}
+
+// ---- reflections: hybrid screen-space reuse + ray-traced fallback (fixes SSR's off-screen holes)
+
+float3 puddle_rt(float2 uv, float3 p, float3 base_col, float2 pixel) {
+    float3 ro = frame.camera_pos.xyz;
+    float3 rd = normalize(p - ro);
+    float t_anim = frame.camera_pos.w;
+    float rx = sin(p.x * 7.0 + t_anim * 1.1) * 0.0018 + sin(p.z * 11.0 - t_anim * 0.8) * 0.0014;
+    float rz = cos(p.z * 8.0 + t_anim * 1.3) * 0.0018 + cos(p.x * 13.0 + t_anim * 0.9) * 0.0014;
+    float3 wn = normalize(float3(rx, 1.0, rz));
+    float3 rdir = reflect(rd, wn);
+
+    float3 refl = sky_color(rdir);
+    RayDesc ray;
+    ray.Origin = p + float3(0.0, 0.03, 0.0);
+    ray.Direction = rdir;
+    ray.TMin = 0.0;
+    ray.TMax = 2000.0;
+    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
+    q.TraceRayInline(scene_tlas, 0, 0xFF, ray);
+    while (q.Proceed()) {}
+    if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        RtHit h = rt_fetch_hit(q.CommittedInstanceID(), q.CommittedPrimitiveIndex(), q.CommittedTriangleBarycentrics(),
+                               q.CommittedObjectToWorld3x4(), ray.Origin, ray.Direction, q.CommittedRayT());
+        // Visible on screen at the same depth: reuse the fully shaded pixel (materials, GI, detail).
+        float4 cs = mul(frame.view_proj, float4(h.position, 1.0));
+        float2 suv = cs.xy / max(cs.w, 1e-4) * 0.5 + 0.5;
+        bool on_screen = cs.w > 0.1 && all(suv > 0.0) && all(suv < 1.0);
+        float3 traced = apply_fog(rt_shade_hit(h, rt_rand2(pixel, 9.0)), h.position);
+        refl = traced;
+        if (on_screen) {
+            float scene_t = linear_depth(scene_depth.SampleLevel(suv, 0.0));
+            float match = 1.0 - smoothstep(0.02, 0.08, abs(scene_t - cs.w) / max(cs.w, 0.1));
+            float2 edge = smoothstep(0.0, 0.04, suv) * smoothstep(1.0, 0.96, suv);
+            refl = lerp(traced, hdr_scene.SampleLevel(suv, 0.0).rgb, match * edge.x * edge.y);
+        }
+    }
+    float ndv = clamp(dot(wn, -rd), 1e-4, 1.0);
+    float rx_f = saturate(1.0 - ndv);
+    float fresnel = 0.04 + 0.96 * (rx_f * rx_f * rx_f * sqrt(rx_f));
+    float blend = saturate(fresnel * 1.05 + 0.22);
+    return lerp(float3(0.045, 0.036, 0.026) + base_col * 0.12, refl * 0.95, blend);
+}
+
+[shader("fragment")]
+float4 rtCompositeFS(FullscreenOut input) : SV_Target {
+    const float2 uv = input.uv;
+    float4 hdr_raw = hdr_scene.SampleLevel(uv, 0.0);
+    float3 c = hdr_raw.rgb;
+    float d = scene_depth.SampleLevel(uv, 0.0);
+    float view_t = d < 1.0 ? linear_depth(d) : 1e6;
+    // AO and GI were ray traced into the forward pass; only reflections and sun shafts remain.
+    if (d < 1.0 && view_t > 0.45 && hdr_raw.a > 0.05) {
+        float3 p = screen_to_world(uv, view_t);
+        c = (asuint(frame.rt_params.w) & RT_FLAG_REFLECTIONS) != 0u ? puddle_rt(uv, p, c, input.position.xy)
+                                                                     : puddle_ssr(uv, p, c, input.position.xy);
+    }
+    if (view_t > 2.5) {
+        c += volumetric_sun_shafts(uv, view_t, input.position.xy);
+    }
+    c += crepuscular_sun_shafts(uv, view_t, input.position.xy);
+    return float4(c, 1.0);
+}
+
+#endif // NOVA_RT

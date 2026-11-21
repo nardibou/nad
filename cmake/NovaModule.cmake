@@ -42,10 +42,18 @@ function(nova_add_module name)
     nova_set_warnings(${target})
 endfunction()
 
-# nova_add_shader(<target> <file.slang> <symbol>)
+# nova_add_shader(<target> <file.slang> <symbol> [PROFILE <spirv_x_y>] [DEFINES <NAME=VALUE>...])
 #   Compiles all entry points of a Slang file to one SPIR-V module and embeds it as
 #   `inline constexpr std::uint32_t <symbol>[]` in <symbol>.hpp, reachable from <target>.
 function(nova_add_shader target source symbol)
+    cmake_parse_arguments(ARG "" "PROFILE" "DEFINES" ${ARGN})
+    if(NOT ARG_PROFILE)
+        set(ARG_PROFILE spirv_1_3)
+    endif()
+    set(defines "")
+    foreach(d IN LISTS ARG_DEFINES)
+        list(APPEND defines "-D${d}")
+    endforeach()
     get_filename_component(src "${source}" ABSOLUTE)
     set(out_dir "${CMAKE_CURRENT_BINARY_DIR}/shaders")
     set(spv "${out_dir}/${symbol}.spv")
@@ -53,7 +61,7 @@ function(nova_add_shader target source symbol)
     add_custom_command(
         OUTPUT "${hpp}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${out_dir}"
-        COMMAND "${NOVA_SLANGC}" "${src}" -target spirv -profile spirv_1_3
+        COMMAND "${NOVA_SLANGC}" "${src}" -target spirv -profile ${ARG_PROFILE} ${defines}
                 -matrix-layout-column-major -fvk-use-entrypoint-name -O2 -o "${spv}"
         COMMAND ${CMAKE_COMMAND} -DINPUT=${spv} -DOUTPUT=${hpp} -DSYMBOL=${symbol}
                 -P "${PROJECT_SOURCE_DIR}/cmake/EmbedSpirv.cmake"

@@ -7,6 +7,7 @@
 #include "nova/rhi/rhi.hpp"
 
 #include <functional>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -65,6 +66,21 @@ struct WorldSettings {
     math::Vec3 point_light_color{0.0f, 0.0f, 0.0f}; // radiance
     f32 point_light_range = 8.0f;
     f32 crosshair_px = 0.0f; // centred crosshair arm length in back-buffer pixels; 0 = none
+
+    // NOVA Lumina RT (used when the device reports rhi::DeviceInfo::ray_tracing): ray-traced sun
+    // shadows, AO, one-bounce diffuse GI and water reflections, temporally accumulated and denoised.
+    // Without RT support the raster path (shadow map, contact AO, SSAO/SSGI, SSR) is used unchanged.
+    bool ray_tracing = true;
+    f32 sun_angular_radius = 0.0093f; // radians; ~2x the real sun, widened by low-sun scattering
+    f32 rt_indirect = 1.0f;           // scale of ray-traced sky + bounce light
+    f32 rt_gi_distance = 16.0f;       // metres a GI ray may travel before it reads the sky
+    f32 rt_ao_radius = 0.9f;          // metres
+    // Sun shadow rays see every occluder within this range, including distant terrain the raster
+    // shadow map (shadow_radius) never covered. Lower it to keep only local occluders.
+    f32 rt_shadow_distance = 2000.0f;
+    u32 rt_gi_rays = 1;               // GI rays per pixel per frame (1-4), accumulated over time
+    bool rt_reflections = true;       // ray-traced water reflections (else screen-space)
+    u32 rt_debug_view = 0;            // 0 off, 1 sun shadow, 2 AO, 3 indirect light (denoised signals)
 };
 
 // glTF-style metallic-roughness material for imported assets. Invalid textures fall back to
@@ -108,6 +124,9 @@ struct WorldRenderStats {
     u32 draw_calls = 0;
     u32 triangles = 0;
     bool shadow_cached = false; // true when PRISM-VSM reused the cached 4K shadow map (0 ms shadow pass!)
+    bool ray_traced = false;    // NOVA Lumina RT lighting was used this frame
+    u32 rt_instances = 0;       // instances in the scene TLAS
+    bool tlas_rebuilt = false;  // false when the cached TLAS was reused
 };
 
 // HDR forward renderer: contact-AO height map (once) + sun shadow map -> sky and lit geometry into
@@ -142,6 +161,8 @@ public:
     bool render_frame(const Camera& camera, const WorldSettings& settings, std::span<const WorldDrawItem> items,
                       const OverlayCallback& overlay = {});
     [[nodiscard]] const WorldRenderStats& stats() const noexcept { return stats_; }
+    // True when the device and renderer can run NOVA Lumina RT (WorldSettings::ray_tracing).
+    [[nodiscard]] bool ray_tracing_available() const noexcept { return rt_ != nullptr; }
     // The contact-AO height map & PRISM-VSM shadow cache auto-invalidate on scene/sun changes; call manually if needed.
     void invalidate_contact_ao() noexcept { height_dirty_ = true; shadow_hash_ = 0; }
     void invalidate_shadows() noexcept { shadow_hash_ = 0; }
@@ -156,11 +177,19 @@ private:
         std::vector<u64> slot_version;
         std::vector<Vertex> pending;
         u64 version = 0;
+        rhi::BlasHandle blas; // static meshes on ray-tracing devices
     };
+    struct RtState;
 
     bool ensure_targets(rhi::Extent extent);
+    [[nodiscard]] MeshId upload_mesh(const MeshData& mesh, bool build_blas);
+    void init_ray_tracing();
+    bool ensure_rt_targets(rhi::Extent extent);
+    void destroy_ray_tracing();
 
     rhi::Device& device_;
+    std::unique_ptr<RtState> rt_; // null without ray-tracing support
+    std::vector<math::Vec3> material_albedo_; // average linear base colour per material (RT hit shading)
     u32 shadow_size_;
     bool valid_ = false;
     bool height_dirty_ = true;
