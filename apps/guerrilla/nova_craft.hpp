@@ -612,14 +612,14 @@ public:
         // ZERO green-channel magenta dip -> ZERO purple/normal-map tint on shadowed clay walls & bevels!
         sky.preset_id = 0;
         sky.sun_hour = 17.35f;
-        sky.sun_intensity = 3.55f;
-        sky.sun_color = {1.0f, 0.68f, 0.38f};
-        sky.sky_zenith = {0.060f, 0.26f, 0.72f};
-        sky.sky_horizon = {0.42f, 0.56f, 0.76f};
-        sky.ground_color = {0.70f, 0.56f, 0.42f};
-        sky.ambient = 0.52f;
+        sky.sun_intensity = 4.0f;
+        sky.sun_color = {1.0f, 0.62f, 0.32f};
+        sky.sky_zenith = {0.050f, 0.20f, 0.62f};
+        sky.sky_horizon = {0.90f, 0.70f, 0.54f}; // peach sunset haze (art-direction reference)
+        sky.ground_color = {0.72f, 0.55f, 0.38f};
+        sky.ambient = 0.50f;
         sky.fog_density = 0.00014f;
-        sky.exposure = 0.60f;
+        sky.exposure = 0.58f;
         sky.bloom = 0.11f;
         sky.saturation = 1.06f;
 
@@ -728,7 +728,7 @@ public:
         if (clay_scene) {
             // Exact back-right golden-hour sun slicing cleanly through the courtyard gap onto the left house, doorstep & road!
             const f32 dh = (sky.sun_hour - 17.35f) * 0.24f;
-            const Vec3 clay_base = math::normalize(Vec3{0.80f, 0.43f, -0.41f});
+            const Vec3 clay_base = math::normalize(Vec3{0.80f, 0.30f, -0.41f}); // low sun: long raking shadows
             const f32 c = std::cos(dh), sn = std::sin(dh);
             s.sun_direction = math::normalize(Vec3{clay_base.x * c - clay_base.z * sn,
                                                    std::clamp(clay_base.y - dh * 0.14f, 0.10f, 0.85f),

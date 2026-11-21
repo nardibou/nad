@@ -46,6 +46,23 @@ frame time (avg / p99) every second.
 
 Controls: A/D or ←/→ orbit, W/S zoom, Space pause, Esc quit.
 
+## Ray-traced lighting (NOVA Lumina RT)
+
+On GPUs with Vulkan ray queries (RTX / RDNA2+ / Arc, and Mesa lavapipe for CI), `WorldRenderer` replaces
+shadow maps and screen-space effects with hybrid ray tracing:
+
+- sun shadows traced towards the solar disc, giving physically correct soft penumbrae that harden at contact
+  and need no bias tuning or fixed coverage radius;
+- ray-traced AO and one-bounce diffuse GI on the real scene triangles, so there are no screen-space haloes
+  and no light leaks through thin walls;
+- water reflections that are traced, reusing the on-screen pixel when it is visible;
+- temporal accumulation (depth-validated, neighbourhood-clamped) and penumbra-aware / à-trous denoising.
+
+Other GPUs keep the raster path automatically. Settings are in `WorldSettings` (`ray_tracing`,
+`sun_angular_radius`, `rt_indirect`, `rt_shadow_distance`, ...). Guerrilla accepts `--no-rt` for A/B
+comparisons and `--rt-view 1|2|3` to show the shadow / AO / indirect signals. `NOVA_NO_RT=1` disables it
+globally. Design: [ADR 0009](docs/adr/0009-hybrid-ray-traced-lighting.md).
+
 ## Layout
 
 ```

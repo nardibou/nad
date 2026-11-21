@@ -38,3 +38,8 @@ locking the engine into Vulkan types or into designs we have not measured yet.
 ## Consequences
 - Everything above the RHI can be tested on machines without a GPU (lavapipe) and in CI.
 - ADR 0005 stays Proposed until the scene is validated on the reference Windows GPUs.
+
+## Addendum (superseded details)
+- Per-frame descriptor sets, the HDR world renderer (PBR, shadows, GI, bloom) and, on capable devices,
+  ray-traced lighting have since replaced the "no descriptor sets" and "baseline forward renderer" notes
+  above. See [ADR 0009](0009-hybrid-ray-traced-lighting.md).

@@ -3,8 +3,10 @@
 #include "nova/core/log.hpp"
 
 #include "world_spv.hpp"
+#include "world_rt_spv.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstddef>
@@ -39,8 +41,33 @@ struct FrameData {
     f32 point_light[4]; // xyz position, w range
     f32 point_color[4]; // rgb radiance, w crosshair size (px)
     f32 output_size[4]; // back-buffer pixels
+    Mat4 prev_view_proj;
+    f32 rt_params[4];  // frame index, sun angular radius, indirect intensity, flags (bits)
+    f32 rt_params2[4]; // GI ray length, AO radius, history reset, GI rays per pixel
+    f32 rt_params3[4]; // sun shadow ray length
 };
-static_assert(sizeof(FrameData) == 192 + 16 * 16);
+static_assert(sizeof(FrameData) == 192 + 16 * 16 + 64 + 3 * 16);
+
+// RT hit shading reads vertices through shader pointers as floats (world.slang kRtVertexFloats).
+static_assert(sizeof(Vertex) == 64 && offsetof(Vertex, normal) == 12 && offsetof(Vertex, color) == 24,
+              "Vertex layout must match kRtVertexFloats offsets in world.slang");
+struct RtInstanceGpu {
+    u64 vertices;
+    u64 indices;
+    f32 albedo[4];   // rgb, a = 1 multiplies vertex colour (procedural materials)
+    f32 emissive[4]; // rgb
+};
+static_assert(sizeof(RtInstanceGpu) == 48);
+
+constexpr u32 kRtFlagHybridShadows = 1u;
+constexpr u32 kRtFlagReflections = 2u;
+
+enum RtShaderSlot {
+    kRtMainVS, kRtMainFS, kRtAssetFS, kRtPostVS, kRtPrepassFS, kRtPrepassTwoSidedFS, kRtPrepassAssetFS,
+    kRtPrepassAssetTwoSidedFS, kRtShadowFS, kRtGiFS,
+    kRtTemporalShadowFS, kRtTemporalGiFS, kRtDenoiseShadowFS, kRtDenoiseGiFS, kRtDenoiseGi2FS, kRtCompositeFS,
+    kRtShaderCount
+};
 
 void set4(f32 (&dst)[4], const Vec3& v, f32 w) {
     dst[0] = v.x;
@@ -85,7 +112,70 @@ void hash_bytes(u64& h, const void* data, usize size) noexcept {
 
 constexpr rhi::Format kHdrFormat = rhi::Format::RGBA16_Float;
 
+void to_3x4(const Mat4& m, f32 (&out)[3][4]) noexcept {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out[r][c] = m.m[c][r]; // Mat4 is column-major: m[column][row]
+        }
+    }
+}
+
+f32 srgb_to_linear(u8 v) noexcept {
+    const f32 c = static_cast<f32>(v) / 255.0f;
+    return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+}
+
+math::Vec3 average_albedo(const ImageData& image) {
+    const usize pixels = static_cast<usize>(image.width) * image.height;
+    if (pixels == 0 || image.rgba.size() < pixels * 4) {
+        return {1.0f, 1.0f, 1.0f};
+    }
+    const usize step = std::max<usize>(1, pixels / 4096);
+    math::Vec3 sum{0.0f, 0.0f, 0.0f};
+    f32 n = 0.0f;
+    for (usize i = 0; i < pixels; i += step) {
+        sum = sum + math::Vec3{srgb_to_linear(image.rgba[i * 4]), srgb_to_linear(image.rgba[i * 4 + 1]),
+                               srgb_to_linear(image.rgba[i * 4 + 2])};
+        n += 1.0f;
+    }
+    return sum * (1.0f / n);
+}
+
 } // namespace
+
+struct WorldRenderer::RtState {
+    rhi::ShaderHandle shaders[kRtShaderCount]{};
+    rhi::PipelineHandle main, main_two_sided, asset, asset_two_sided;
+    rhi::PipelineHandle prepass, prepass_two_sided, prepass_asset, prepass_asset_two_sided;
+    rhi::PipelineHandle shadow_trace, gi_trace, temporal_shadow, temporal_gi, denoise_shadow, denoise_gi, denoise_gi2, composite;
+    rhi::TextureHandle dyn_shadow_map; // casters outside the TLAS (skinned / alpha-tested)
+    bool dyn_shadow_written = false;
+    // Internal-resolution targets; [2] = ping-pong history (index = frame parity).
+    rhi::TextureHandle normal, depth[2], shadow_raw, gi_raw, shadow_hist[2], gi_hist[2], shadow, gi;
+    rhi::Extent extent{};
+    std::vector<rhi::TlasHandle> tlas;         // one per frame in flight
+    std::vector<rhi::BufferHandle> instances;  // RtInstanceGpu table per frame in flight
+    std::vector<u64> tlas_hash;
+    u32 capacity = 0;
+    Mat4 prev_view_proj = Mat4::identity();
+    u32 frame = 0;
+    bool history_valid = false;
+    // Lighting at the last frame: a discontinuous change invalidates the accumulated history.
+    Vec3 last_sun{0, 0, 0};
+    std::array<f32, 13> last_light{};
+    std::vector<rhi::TlasInstance> tlas_scratch;
+    std::vector<RtInstanceGpu> gpu_scratch;
+
+    std::vector<rhi::PipelineHandle> pipelines() const {
+        return {main, main_two_sided, asset, asset_two_sided, prepass, prepass_two_sided, prepass_asset,
+                prepass_asset_two_sided, shadow_trace, gi_trace, temporal_shadow, temporal_gi, denoise_shadow,
+                denoise_gi, denoise_gi2, composite};
+    }
+    std::vector<rhi::TextureHandle> targets() const {
+        return {normal, depth[0], depth[1], shadow_raw, gi_raw, shadow_hist[0], shadow_hist[1], gi_hist[0], gi_hist[1],
+                shadow, gi};
+    }
+};
 
 WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
     : device_(device), shadow_size_(shadow_map_size) {
@@ -236,11 +326,201 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
              std::ranges::all_of(frame_buffers_, [](rhi::BufferHandle b) { return b.valid(); });
     if (!valid_) {
         NOVA_ERROR("Renderer", "world renderer initialisation failed");
+        return;
+    }
+    if (device_.info().ray_tracing) {
+        init_ray_tracing();
     }
 }
 
+void WorldRenderer::init_ray_tracing() {
+    struct Entry {
+        const char* name;
+        rhi::ShaderStage stage;
+    };
+    const Entry entries[kRtShaderCount] = {
+        {"mainVS", rhi::ShaderStage::Vertex},
+        {"mainFS", rhi::ShaderStage::Fragment},
+        {"assetFS", rhi::ShaderStage::Fragment},
+        {"postVS", rhi::ShaderStage::Vertex},
+        {"rtPrepassFS", rhi::ShaderStage::Fragment},
+        {"rtPrepassTwoSidedFS", rhi::ShaderStage::Fragment},
+        {"rtPrepassAssetFS", rhi::ShaderStage::Fragment},
+        {"rtPrepassAssetTwoSidedFS", rhi::ShaderStage::Fragment},
+        {"rtShadowFS", rhi::ShaderStage::Fragment},
+        {"rtGiFS", rhi::ShaderStage::Fragment},
+        {"rtTemporalShadowFS", rhi::ShaderStage::Fragment},
+        {"rtTemporalGiFS", rhi::ShaderStage::Fragment},
+        {"rtDenoiseShadowFS", rhi::ShaderStage::Fragment},
+        {"rtDenoiseGiFS", rhi::ShaderStage::Fragment},
+        {"rtDenoiseGi2FS", rhi::ShaderStage::Fragment},
+        {"rtCompositeFS", rhi::ShaderStage::Fragment},
+    };
+    auto rt = std::make_unique<RtState>();
+    for (int i = 0; i < kRtShaderCount; ++i) {
+        rt->shaders[i] = device_.create_shader({world_rt_spv, entries[i].name, entries[i].stage});
+        if (!rt->shaders[i].valid()) {
+            NOVA_WARN("Renderer", "ray-tracing shader {} unavailable; using the raster lighting path", entries[i].name);
+            rt_ = std::move(rt);
+            destroy_ray_tracing();
+            return;
+        }
+    }
+
+    using BT = rhi::BindingType;
+    using F = rhi::Filter;
+    const rhi::BindingDesc frame_binding{0, BT::UniformBuffer};
+    const std::vector<rhi::VertexAttribute> attributes = {
+        {0, rhi::VertexFormat::Float3, static_cast<u32>(offsetof(Vertex, position))},
+        {1, rhi::VertexFormat::Float3, static_cast<u32>(offsetof(Vertex, normal))},
+        {2, rhi::VertexFormat::Float4, static_cast<u32>(offsetof(Vertex, color))},
+        {3, rhi::VertexFormat::Float2, static_cast<u32>(offsetof(Vertex, uv))},
+        {4, rhi::VertexFormat::Float4, static_cast<u32>(offsetof(Vertex, tangent))},
+    };
+
+    rhi::GraphicsPipelineDesc main;
+    main.vertex_shader = rt->shaders[kRtMainVS];
+    main.fragment_shader = rt->shaders[kRtMainFS];
+    main.vertex_stride = sizeof(Vertex);
+    main.attributes = attributes;
+    main.push_constant_size = sizeof(ObjectPush);
+    main.bindings = {frame_binding, {1, BT::SampledTexture, F::Nearest}, {5, BT::SampledTexture, F::Nearest},
+                     {12, BT::SampledTexture, F::Nearest}, {13, BT::SampledTexture, F::Nearest}};
+    main.color_format = kHdrFormat;
+    rt->main = device_.create_graphics_pipeline(main);
+    main.cull = rhi::CullMode::None;
+    rt->main_two_sided = device_.create_graphics_pipeline(main);
+
+    rhi::GraphicsPipelineDesc asset = main;
+    asset.fragment_shader = rt->shaders[kRtAssetFS];
+    for (u32 b = 7; b <= 11; ++b) {
+        asset.bindings.push_back({b, BT::SampledTexture, F::Material});
+    }
+    asset.cull = rhi::CullMode::Back;
+    rt->asset = device_.create_graphics_pipeline(asset);
+    asset.cull = rhi::CullMode::None;
+    rt->asset_two_sided = device_.create_graphics_pipeline(asset);
+
+    rhi::GraphicsPipelineDesc prepass = main;
+    prepass.fragment_shader = rt->shaders[kRtPrepassFS];
+    prepass.bindings = {frame_binding};
+    prepass.cull = rhi::CullMode::Back;
+    rt->prepass = device_.create_graphics_pipeline(prepass);
+    prepass.cull = rhi::CullMode::None;
+    prepass.fragment_shader = rt->shaders[kRtPrepassTwoSidedFS];
+    rt->prepass_two_sided = device_.create_graphics_pipeline(prepass);
+    prepass.fragment_shader = rt->shaders[kRtPrepassAssetFS];
+    prepass.bindings = {frame_binding, {7, BT::SampledTexture, F::Material}};
+    prepass.cull = rhi::CullMode::Back;
+    rt->prepass_asset = device_.create_graphics_pipeline(prepass);
+    prepass.cull = rhi::CullMode::None;
+    prepass.fragment_shader = rt->shaders[kRtPrepassAssetTwoSidedFS];
+    rt->prepass_asset_two_sided = device_.create_graphics_pipeline(prepass);
+
+    auto fullscreen = [&](RtShaderSlot fs, std::vector<rhi::BindingDesc> bindings) {
+        rhi::GraphicsPipelineDesc desc;
+        desc.vertex_shader = rt->shaders[kRtPostVS];
+        desc.fragment_shader = rt->shaders[fs];
+        desc.bindings = std::move(bindings);
+        desc.cull = rhi::CullMode::None;
+        desc.depth_test = false;
+        desc.depth_format = rhi::Format::Undefined;
+        desc.color_format = kHdrFormat;
+        return device_.create_graphics_pipeline(desc);
+    };
+    const rhi::BindingDesc depth_b{14, BT::SampledTexture, F::Nearest};
+    const rhi::BindingDesc normal_b{16, BT::SampledTexture, F::Nearest};
+    const rhi::BindingDesc tlas_b{17, BT::AccelerationStructure};
+    const rhi::BindingDesc inst_b{18, BT::StorageBuffer};
+    rt->shadow_trace = fullscreen(kRtShadowFS, {frame_binding, depth_b, normal_b, tlas_b});
+    rt->gi_trace = fullscreen(kRtGiFS, {frame_binding, depth_b, normal_b, tlas_b, inst_b});
+    const std::vector<rhi::BindingDesc> temporal = {frame_binding,
+                                                    {12, BT::SampledTexture, F::Nearest},
+                                                    {13, BT::SampledTexture, F::Linear},
+                                                    depth_b,
+                                                    {15, BT::SampledTexture, F::Nearest},
+                                                    normal_b};
+    rt->temporal_shadow = fullscreen(kRtTemporalShadowFS, temporal);
+    rt->temporal_gi = fullscreen(kRtTemporalGiFS, temporal);
+    const std::vector<rhi::BindingDesc> denoise = {frame_binding, {12, BT::SampledTexture, F::Nearest}, depth_b,
+                                                   normal_b};
+    rt->denoise_shadow = fullscreen(kRtDenoiseShadowFS, denoise);
+    rt->denoise_gi = fullscreen(kRtDenoiseGiFS, denoise);
+    rt->denoise_gi2 = fullscreen(kRtDenoiseGi2FS, denoise);
+    rt->composite = fullscreen(kRtCompositeFS, {frame_binding,
+                                                {1, BT::SampledTexture, F::Nearest},
+                                                {2, BT::SampledTexture, F::Linear},
+                                                {3, BT::SampledTexture, F::Nearest},
+                                                tlas_b,
+                                                inst_b});
+    rt->dyn_shadow_map = device_.create_texture({shadow_size_, shadow_size_, rhi::Format::D32_Float, true, true});
+
+    const bool ok = std::ranges::all_of(rt->pipelines(), [](rhi::PipelineHandle p) { return p.valid(); }) &&
+                    rt->dyn_shadow_map.valid();
+    rt_ = std::move(rt);
+    if (!ok) {
+        NOVA_WARN("Renderer", "ray-tracing pipelines unavailable; using the raster lighting path");
+        destroy_ray_tracing();
+        return;
+    }
+    NOVA_INFO("Renderer", "NOVA Lumina RT enabled: ray-traced shadows, AO, GI and reflections");
+}
+
+void WorldRenderer::destroy_ray_tracing() {
+    if (!rt_) {
+        return;
+    }
+    for (rhi::TlasHandle t : rt_->tlas) {
+        device_.destroy(t);
+    }
+    for (rhi::BufferHandle b : rt_->instances) {
+        device_.destroy(b);
+    }
+    for (rhi::TextureHandle t : rt_->targets()) {
+        device_.destroy(t);
+    }
+    device_.destroy(rt_->dyn_shadow_map);
+    for (rhi::PipelineHandle p : rt_->pipelines()) {
+        device_.destroy(p);
+    }
+    for (rhi::ShaderHandle s : rt_->shaders) {
+        device_.destroy(s);
+    }
+    rt_.reset();
+}
+
+bool WorldRenderer::ensure_rt_targets(rhi::Extent extent) {
+    RtState& rt = *rt_;
+    if (rt.normal.valid() && rt.extent.width == extent.width && rt.extent.height == extent.height) {
+        return true;
+    }
+    for (rhi::TextureHandle t : rt.targets()) {
+        device_.destroy(t);
+    }
+    auto color = [&] { return device_.create_texture({extent.width, extent.height, kHdrFormat, true, true}); };
+    auto depth = [&] { return device_.create_texture({extent.width, extent.height, rhi::Format::D32_Float, true, true}); };
+    rt.normal = color();
+    rt.depth[0] = depth();
+    rt.depth[1] = depth();
+    rt.shadow_raw = color();
+    rt.gi_raw = color();
+    rt.shadow_hist[0] = color();
+    rt.shadow_hist[1] = color();
+    rt.gi_hist[0] = color();
+    rt.gi_hist[1] = color();
+    rt.shadow = color();
+    rt.gi = color();
+    rt.history_valid = false;
+    const auto targets = rt.targets();
+    const bool ok = std::ranges::all_of(targets, [](rhi::TextureHandle t) { return t.valid(); });
+    rt.extent = ok ? extent : rhi::Extent{};
+    return ok;
+}
+
 WorldRenderer::~WorldRenderer() {
+    destroy_ray_tracing();
     for (const GpuMesh& m : meshes_) {
+        device_.destroy(m.blas);
         for (rhi::BufferHandle b : m.dynamic) {
             device_.destroy(b);
         }
@@ -271,6 +551,10 @@ WorldRenderer::~WorldRenderer() {
 }
 
 MeshId WorldRenderer::upload(const MeshData& mesh) {
+    return upload_mesh(mesh, true);
+}
+
+MeshId WorldRenderer::upload_mesh(const MeshData& mesh, bool build_blas) {
     if (mesh.vertices.empty() || mesh.indices.empty()) {
         return {};
     }
@@ -284,6 +568,10 @@ MeshId WorldRenderer::upload(const MeshData& mesh) {
         device_.destroy(gpu.vertices);
         device_.destroy(gpu.indices);
         return {};
+    }
+    if (build_blas && rt_) {
+        gpu.blas = device_.create_blas({gpu.vertices, static_cast<u32>(mesh.vertices.size()), sizeof(Vertex),
+                                        gpu.indices, gpu.index_count});
     }
     meshes_.push_back(gpu);
     return {static_cast<u32>(meshes_.size())};
@@ -322,6 +610,7 @@ MaterialId WorldRenderer::add_material(const PbrMaterial& material) {
     fallback(m.occlusion, white_linear_);
     fallback(m.emissive, white_srgb_);
     materials_.push_back(m);
+    material_albedo_.push_back({m.base_color_factor.x, m.base_color_factor.y, m.base_color_factor.z});
     return {static_cast<u32>(materials_.size())};
 }
 
@@ -381,13 +670,19 @@ std::vector<MaterialId> WorldRenderer::upload_materials(const ModelData& model) 
                          : src.alpha_mode == AlphaMode::Blend ? 0.5f
                                                               : 0.0f;
         m.double_sided = src.double_sided;
-        materials.push_back(add_material(m));
+        const MaterialId id = add_material(m);
+        if (src.base_color_image >= 0 && static_cast<usize>(src.base_color_image) < model.images.size()) {
+            const math::Vec3 avg = average_albedo(model.images[static_cast<usize>(src.base_color_image)]);
+            math::Vec3& a = material_albedo_[id.id - 1];
+            a = {a.x * avg.x, a.y * avg.y, a.z * avg.z};
+        }
+        materials.push_back(id);
     }
     return materials;
 }
 
 MeshId WorldRenderer::upload_dynamic(const MeshData& mesh) {
-    const MeshId id = upload(mesh);
+    const MeshId id = upload_mesh(mesh, false); // animated vertices: kept out of the TLAS
     if (id.id == 0) {
         return id;
     }
@@ -480,6 +775,108 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
     if (output.width == 0 || output.height == 0 || !ensure_targets(extent)) {
         return false;
     }
+
+    // ---- NOVA Lumina RT: gather TLAS instances (static, opaque, shadow-casting meshes). Everything
+    // else that casts (skinned, alpha-tested) goes to a small hybrid shadow map so nothing is lost.
+    const bool use_rt = rt_ && settings.ray_tracing && ensure_rt_targets(extent);
+    const usize frame_slot = frame_counter_ % frame_buffers_.size();
+    auto valid_material = [&](const WorldDrawItem& item) {
+        return item.material.valid() && item.material.id <= materials_.size();
+    };
+    auto in_tlas = [&](const WorldDrawItem& item) {
+        if (item.mesh.id == 0 || item.mesh.id > meshes_.size() || !item.casts_shadow) {
+            return false;
+        }
+        const GpuMesh& gm = meshes_[item.mesh.id - 1];
+        return gm.blas.valid() && gm.dynamic.empty() &&
+               (!valid_material(item) || materials_[item.material.id - 1].alpha_cutoff <= 0.0f);
+    };
+    bool hybrid_shadows = false;
+    u64 tlas_hash = 0;
+    if (use_rt) {
+        RtState& rt = *rt_;
+        rt.tlas_scratch.clear();
+        rt.gpu_scratch.clear();
+        tlas_hash = 14695981039346656037ull;
+        for (const WorldDrawItem& item : items) {
+            if (!in_tlas(item)) {
+                hybrid_shadows = hybrid_shadows || (item.casts_shadow && item.mesh.id != 0 && item.mesh.id <= meshes_.size());
+                continue;
+            }
+            const GpuMesh& gm = meshes_[item.mesh.id - 1];
+            rhi::TlasInstance ti;
+            ti.blas = gm.blas;
+            to_3x4(item.transform, ti.transform);
+            ti.custom_index = static_cast<u32>(rt.gpu_scratch.size());
+            RtInstanceGpu gi{};
+            gi.vertices = device_.buffer_address(gm.vertices);
+            gi.indices = device_.buffer_address(gm.indices);
+            if (valid_material(item)) {
+                const math::Vec3& a = material_albedo_[item.material.id - 1];
+                const PbrMaterial& m = materials_[item.material.id - 1];
+                gi.albedo[0] = a.x;
+                gi.albedo[1] = a.y;
+                gi.albedo[2] = a.z;
+                set4(gi.emissive, m.emissive_factor * 4.0f, 0.0f); // kEmissiveScale in world.slang
+            } else {
+                gi.albedo[0] = gi.albedo[1] = gi.albedo[2] = gi.albedo[3] = 1.0f;
+            }
+            hash_bytes(tlas_hash, &item.mesh.id, sizeof(item.mesh.id));
+            hash_bytes(tlas_hash, &item.material.id, sizeof(item.material.id));
+            hash_bytes(tlas_hash, &item.transform, sizeof(item.transform));
+            hash_bytes(tlas_hash, gi.albedo, sizeof(gi.albedo));
+            rt.tlas_scratch.push_back(ti);
+            rt.gpu_scratch.push_back(gi);
+        }
+        const u32 count = static_cast<u32>(rt.tlas_scratch.size());
+        if (count > rt.capacity || rt.tlas.empty()) {
+            for (rhi::TlasHandle t : rt.tlas) {
+                device_.destroy(t);
+            }
+            for (rhi::BufferHandle b : rt.instances) {
+                device_.destroy(b);
+            }
+            rt.tlas.clear();
+            rt.instances.clear();
+            rt.capacity = std::max(256u, count + count / 2);
+            for (u32 i = 0; i < device_.frames_in_flight(); ++i) {
+                rt.tlas.push_back(device_.create_tlas(rt.capacity));
+                rt.instances.push_back(
+                    device_.create_buffer({rt.capacity * sizeof(RtInstanceGpu), rhi::BufferUsage::Storage, nullptr}));
+            }
+            rt.tlas_hash.assign(device_.frames_in_flight(), 0);
+            if (!std::ranges::all_of(rt.tlas, [](rhi::TlasHandle t) { return t.valid(); }) ||
+                !std::ranges::all_of(rt.instances, [](rhi::BufferHandle b) { return b.valid(); })) {
+                NOVA_ERROR("Renderer", "TLAS allocation failed; disabling ray tracing");
+                destroy_ray_tracing();
+                return false;
+            }
+        }
+    } else if (rt_) {
+        rt_->history_valid = false;
+    }
+    if (use_rt) {
+        // Smooth time-of-day motion keeps accumulating (the neighbourhood clamp absorbs it); jumps
+        // such as preset switches would otherwise ghost the old lighting for ~1 s.
+        RtState& rt = *rt_;
+        const Vec3 sun_now = math::normalize(settings.sun_direction);
+        const std::array<f32, 13> light{settings.sun_color.x * settings.sun_intensity,
+                                        settings.sun_color.y * settings.sun_intensity,
+                                        settings.sun_color.z * settings.sun_intensity,
+                                        settings.sky_zenith.x, settings.sky_zenith.y, settings.sky_zenith.z,
+                                        settings.sky_horizon.x, settings.sky_horizon.y, settings.sky_horizon.z,
+                                        settings.ground_color.x, settings.ground_color.y, settings.ground_color.z,
+                                        settings.ambient * settings.rt_indirect};
+        bool jump = math::dot(sun_now, rt.last_sun) < 0.9995f;
+        for (usize i = 0; i < light.size() && !jump; ++i) {
+            jump = std::abs(light[i] - rt.last_light[i]) > 0.02f * std::max(1.0f, std::abs(light[i]));
+        }
+        if (jump) {
+            rt.history_valid = false;
+        }
+        rt.last_sun = sun_now;
+        rt.last_light = light;
+    }
     rhi::CommandList* cmd = device_.begin_frame();
     if (!cmd) {
         return false;
@@ -532,6 +929,24 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
     set4(fd.point_light, settings.point_light_position, settings.point_light_range);
     set4(fd.point_color, settings.point_light_color, settings.crosshair_px);
     set4(fd.output_size, {static_cast<f32>(output.width), static_cast<f32>(output.height), 0.0f}, 0.0f);
+    fd.prev_view_proj = fd.view_proj;
+    if (use_rt) {
+        const RtState& rt = *rt_;
+        if (rt.history_valid) {
+            fd.prev_view_proj = rt.prev_view_proj;
+        }
+        const u32 flags = (hybrid_shadows ? kRtFlagHybridShadows : 0u) | (settings.rt_reflections ? kRtFlagReflections : 0u) |
+                          ((std::min(settings.rt_debug_view, 3u)) << 2u);
+        fd.rt_params[0] = static_cast<f32>(rt.frame % 1024u);
+        fd.rt_params[1] = std::clamp(settings.sun_angular_radius, 0.0f, 0.2f);
+        fd.rt_params[2] = std::max(settings.rt_indirect, 0.0f);
+        fd.rt_params[3] = std::bit_cast<f32>(flags);
+        fd.rt_params2[0] = settings.rt_gi_distance;
+        fd.rt_params2[1] = settings.rt_ao_radius;
+        fd.rt_params2[2] = rt.history_valid ? 0.0f : 1.0f;
+        fd.rt_params2[3] = static_cast<f32>(std::clamp(settings.rt_gi_rays, 1u, 4u));
+        fd.rt_params3[0] = std::max(settings.rt_shadow_distance, 1.0f);
+    }
 
     // One buffer per frame in flight: begin_frame() has waited for the GPU to finish this slot.
     const rhi::BufferHandle frame_buffer = frame_buffers_[frame_counter_ % frame_buffers_.size()];
@@ -593,11 +1008,8 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
         ++stats_.draw_calls;
         stats_.triangles += mesh.index_count / 3;
     };
-    auto valid_material = [&](const WorldDrawItem& item) {
-        return item.material.valid() && item.material.id <= materials_.size();
-    };
-    // Depth-only render of the shadow casters with `light_view_proj` taken from `constants`.
-    auto depth_pass = [&](rhi::TextureHandle target, const rhi::ResourceBinding& constants) {
+    // Depth-only render of the shadow casters accepted by `include`, with `light_view_proj` from `constants`.
+    auto depth_pass = [&](rhi::TextureHandle target, const rhi::ResourceBinding& constants, auto&& include) {
         rhi::RenderPassDesc pass;
         pass.back_buffer = false;
         pass.depth = target;
@@ -605,13 +1017,13 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
         cmd->bind_pipeline(shadow_pipeline_);
         cmd->bind_resources({&constants, 1});
         for (const WorldDrawItem& item : items) {
-            if (item.casts_shadow && !item.material.valid()) {
+            if (item.casts_shadow && !item.material.valid() && include(item)) {
                 draw_mesh(item);
             }
         }
         bool asset_bound = false;
         for (const WorldDrawItem& item : items) {
-            if (!item.casts_shadow || !valid_material(item)) {
+            if (!item.casts_shadow || !valid_material(item) || !include(item)) {
                 continue;
             }
             if (!asset_bound) {
@@ -644,7 +1056,7 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
         FrameData hd = fd;
         hd.light_view_proj = fd.height_view_proj;
         device_.update_buffer(height_frame_buffer_, &hd, sizeof(hd));
-        depth_pass(height_map_, {0, height_frame_buffer_, {}});
+        depth_pass(height_map_, {0, height_frame_buffer_, {}}, [](const WorldDrawItem&) { return true; });
         height_dirty_ = false;
     }
 
@@ -667,11 +1079,104 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
     }
     if (sh == 0) sh = 1;
     if (sh != shadow_hash_) {
-        depth_pass(shadow_map_, frame_res);
+        depth_pass(shadow_map_, frame_res, [](const WorldDrawItem&) { return true; });
         shadow_hash_ = sh;
         stats_.shadow_cached = false;
     } else {
         stats_.shadow_cached = true;
+    }
+
+    // ---- 1.5 NOVA Lumina RT: TLAS, prepass, shadow/AO + GI rays, temporal accumulation, denoise
+    if (use_rt) {
+        RtState& rt = *rt_;
+        const u32 cur = rt.frame & 1u;
+        const u32 prev = cur ^ 1u;
+        const rhi::TlasHandle tlas = rt.tlas[frame_slot];
+        const rhi::BufferHandle instances = rt.instances[frame_slot];
+        stats_.ray_traced = true;
+        stats_.rt_instances = static_cast<u32>(rt.tlas_scratch.size());
+        // The slot's TLAS + instance table were last used two frames ago (fenced by begin_frame).
+        if (tlas_hash != rt.tlas_hash[frame_slot]) {
+            if (!rt.gpu_scratch.empty()) {
+                device_.update_buffer(instances, rt.gpu_scratch.data(), rt.gpu_scratch.size() * sizeof(RtInstanceGpu));
+            }
+            cmd->build_tlas(tlas, rt.tlas_scratch);
+            rt.tlas_hash[frame_slot] = tlas_hash;
+            stats_.tlas_rebuilt = true;
+        }
+
+        if (hybrid_shadows || !rt.dyn_shadow_written) {
+            depth_pass(rt.dyn_shadow_map, frame_res, [&](const WorldDrawItem& item) { return !in_tlas(item); });
+            rt.dyn_shadow_written = true;
+        }
+
+        {
+            rhi::RenderPassDesc pass;
+            pass.back_buffer = false;
+            pass.color = rt.normal;
+            pass.depth = rt.depth[cur];
+            pass.clear.color[3] = 0.0f;
+            cmd->begin_render_pass(pass);
+            for (bool two_sided : {false, true}) {
+                cmd->bind_pipeline(two_sided ? rt.prepass_two_sided : rt.prepass);
+                cmd->bind_resources({&frame_res, 1});
+                for (const WorldDrawItem& item : items) {
+                    if (item.two_sided == two_sided && !item.material.valid()) {
+                        draw_mesh(item);
+                    }
+                }
+            }
+            for (bool two_sided : {false, true}) {
+                bool bound = false;
+                for (const WorldDrawItem& item : items) {
+                    if (!valid_material(item) || item.two_sided != two_sided) {
+                        continue;
+                    }
+                    if (!bound) {
+                        cmd->bind_pipeline(two_sided ? rt.prepass_asset_two_sided : rt.prepass_asset);
+                        bound = true;
+                    }
+                    const rhi::ResourceBinding res[] = {frame_res, {7, {}, materials_[item.material.id - 1].base_color}};
+                    cmd->bind_resources(res);
+                    draw_mesh(item);
+                }
+            }
+            cmd->end_render_pass();
+        }
+
+        if (!rt.history_valid) {
+            // Histories must be shader-readable before their first (ignored) use.
+            for (rhi::TextureHandle t : {rt.shadow_hist[prev], rt.gi_hist[prev]}) {
+                rhi::RenderPassDesc pass;
+                pass.back_buffer = false;
+                pass.color = t;
+                pass.default_depth = false;
+                cmd->begin_render_pass(pass);
+                cmd->end_render_pass();
+            }
+            rhi::RenderPassDesc pass;
+            pass.back_buffer = false;
+            pass.depth = rt.depth[prev];
+            cmd->begin_render_pass(pass);
+            cmd->end_render_pass();
+        }
+
+        const rhi::ResourceBinding depth_res{14, {}, rt.depth[cur]};
+        const rhi::ResourceBinding normal_res{16, {}, rt.normal};
+        const rhi::ResourceBinding tlas_res{17, {}, {}, tlas};
+        const rhi::ResourceBinding inst_res{18, instances, {}};
+        fullscreen_pass(rt.shadow_raw, rt.shadow_trace, {depth_res, normal_res, tlas_res});
+        fullscreen_pass(rt.gi_raw, rt.gi_trace, {depth_res, normal_res, tlas_res, inst_res});
+        fullscreen_pass(rt.shadow_hist[cur], rt.temporal_shadow,
+                        {{12, {}, rt.shadow_raw}, {13, {}, rt.shadow_hist[prev]}, depth_res, {15, {}, rt.depth[prev]},
+                         normal_res});
+        fullscreen_pass(rt.gi_hist[cur], rt.temporal_gi,
+                        {{12, {}, rt.gi_raw}, {13, {}, rt.gi_hist[prev]}, depth_res, {15, {}, rt.depth[prev]},
+                         normal_res});
+        fullscreen_pass(rt.shadow, rt.denoise_shadow, {{12, {}, rt.shadow_hist[cur]}, depth_res, normal_res});
+        // Two a-trous passes; gi_raw is free again after the temporal pass and serves as the ping buffer.
+        fullscreen_pass(rt.gi_raw, rt.denoise_gi, {{12, {}, rt.gi_hist[cur]}, depth_res, normal_res});
+        fullscreen_pass(rt.gi, rt.denoise_gi2, {{12, {}, rt.gi_raw}, depth_res, normal_res});
     }
 
     // ---- 2. sky + lit geometry into HDR colour + sampled depth
@@ -686,10 +1191,20 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
         cmd->bind_resources({&frame_res, 1});
         cmd->draw(3);
 
-        const rhi::ResourceBinding main_res[] = {frame_res, {1, {}, shadow_map_}, {5, {}, height_map_}};
+        // RT: binding 1 is the hybrid shadow map (non-TLAS casters); 12/13 are the denoised RT signals.
+        std::vector<rhi::ResourceBinding> base_res{frame_res, {1, {}, use_rt ? rt_->dyn_shadow_map : shadow_map_},
+                                                   {5, {}, height_map_}};
+        if (use_rt) {
+            base_res.push_back({12, {}, rt_->shadow});
+            base_res.push_back({13, {}, rt_->gi});
+        }
+        const rhi::PipelineHandle main_pso[2] = {use_rt ? rt_->main : main_pipeline_,
+                                                 use_rt ? rt_->main_two_sided : main_two_sided_pipeline_};
+        const rhi::PipelineHandle asset_pso[2] = {use_rt ? rt_->asset : asset_pipeline_,
+                                                  use_rt ? rt_->asset_two_sided : asset_two_sided_pipeline_};
         for (bool two_sided : {false, true}) {
-            cmd->bind_pipeline(two_sided ? main_two_sided_pipeline_ : main_pipeline_);
-            cmd->bind_resources(main_res);
+            cmd->bind_pipeline(main_pso[two_sided ? 1 : 0]);
+            cmd->bind_resources(base_res);
             for (const WorldDrawItem& item : items) {
                 if (item.two_sided == two_sided && !item.material.valid()) {
                     draw_mesh(item);
@@ -697,6 +1212,7 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
             }
         }
         // Imported assets: one descriptor set per draw for its material textures.
+        std::vector<rhi::ResourceBinding> res = base_res;
         for (bool two_sided : {false, true}) {
             bool bound = false;
             for (const WorldDrawItem& item : items) {
@@ -704,14 +1220,16 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
                     continue;
                 }
                 if (!bound) {
-                    cmd->bind_pipeline(two_sided ? asset_two_sided_pipeline_ : asset_pipeline_);
+                    cmd->bind_pipeline(asset_pso[two_sided ? 1 : 0]);
                     bound = true;
                 }
                 const PbrMaterial& m = materials_[item.material.id - 1];
-                const rhi::ResourceBinding res[] = {
-                    frame_res, {1, {}, shadow_map_}, {5, {}, height_map_}, {7, {}, m.base_color},
-                    {8, {}, m.metallic_roughness}, {9, {}, m.normal}, {10, {}, m.occlusion}, {11, {}, m.emissive},
-                };
+                res.resize(base_res.size());
+                res.insert(res.end(), {{7, {}, m.base_color},
+                                       {8, {}, m.metallic_roughness},
+                                       {9, {}, m.normal},
+                                       {10, {}, m.occlusion},
+                                       {11, {}, m.emissive}});
                 cmd->bind_resources(res);
                 draw_mesh(item);
             }
@@ -719,14 +1237,27 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
         cmd->end_render_pass();
     }
 
-    // ---- 2.5a. PRISM Real-Time Dual-Scale Horizon-Angle XeGTAO + Multi-Bounce Colored SSGI
-    fullscreen_pass(gi_ao_raw_, gi_ao_pipeline_, {{2, {}, hdr_target_}, {3, {}, scene_depth_}});
-    // ---- 2.5b. Edge-Preserving 5x5 Depth+Normal Joint-Bilateral Denoiser (silky noise-free GI & crevice AO!)
-    fullscreen_pass(gi_ao_blur_, gi_ao_denoise_pipeline_, {{2, {}, gi_ao_raw_}, {3, {}, scene_depth_}});
+    if (use_rt) {
+        // ---- 3 (RT). AO/GI are already in the forward pass: reflections + sun shafts only.
+        fullscreen_pass(lit_target_, rt_->composite,
+                        {{1, {}, shadow_map_},
+                         {2, {}, hdr_target_},
+                         {3, {}, scene_depth_},
+                         {17, {}, {}, rt_->tlas[frame_slot]},
+                         {18, rt_->instances[frame_slot], {}}});
+        rt_->prev_view_proj = fd.view_proj;
+        rt_->history_valid = true;
+        ++rt_->frame;
+    } else {
+        // ---- 2.5a. PRISM Real-Time Dual-Scale Horizon-Angle XeGTAO + Multi-Bounce Colored SSGI
+        fullscreen_pass(gi_ao_raw_, gi_ao_pipeline_, {{2, {}, hdr_target_}, {3, {}, scene_depth_}});
+        // ---- 2.5b. Edge-Preserving 5x5 Depth+Normal Joint-Bilateral Denoiser (silky noise-free GI & crevice AO!)
+        fullscreen_pass(gi_ao_blur_, gi_ao_denoise_pipeline_, {{2, {}, gi_ao_raw_}, {3, {}, scene_depth_}});
 
-    // ---- 3. Composite: Denoised Multi-Bounce AO + Denoised Colored SSGI + Volumetric Sun Shafts + SSR Puddles
-    fullscreen_pass(lit_target_, composite_pipeline_,
-                    {{1, {}, shadow_map_}, {2, {}, hdr_target_}, {3, {}, scene_depth_}, {4, {}, gi_ao_blur_}});
+        // ---- 3. Composite: Denoised Multi-Bounce AO + Denoised Colored SSGI + Volumetric Sun Shafts + SSR Puddles
+        fullscreen_pass(lit_target_, composite_pipeline_,
+                        {{1, {}, shadow_map_}, {2, {}, hdr_target_}, {3, {}, scene_depth_}, {4, {}, gi_ao_blur_}});
+    }
 
     // ---- 4. bloom: 13-tap Jimenez bright pass at quarter resolution + 2x separable 13-tap Gaussian blur
     fullscreen_pass(bloom_a_, bloom_down_pipeline_, {{6, {}, lit_target_}});

@@ -137,13 +137,15 @@ TEST_CASE("gpu: offscreen target resizes") {
     CHECK(device->validation_error_count() == 0);
 }
 
-TEST_CASE("gpu: world renderer casts sun shadows through the shadow map") {
+TEST_CASE("gpu: world renderer casts sun shadows (ray traced and shadow map)") {
     constexpr u32 kW = 128, kH = 128;
     auto device = make_device(kW, kH);
     REQUIRE(device);
-    {
+    for (const bool ray_tracing : {true, false}) {
+        CAPTURE(ray_tracing);
         renderer::WorldRenderer world(*device, 512);
         REQUIRE(world.valid());
+        CHECK(world.ray_tracing_available() == device->info().ray_tracing);
         // Material id 15 has no procedural detail, so pixels are flat albedo * lighting.
         const math::Vec4 grey{0.5f, 0.5f, 0.5f, 15.0f};
         renderer::MeshData ground, box;
@@ -156,11 +158,16 @@ TEST_CASE("gpu: world renderer casts sun shadows through the shadow map") {
         camera.target = {0, 0, 0};
         camera.up = {0, 0, -1};
         renderer::WorldSettings settings;
+        settings.ray_tracing = ray_tracing;
         settings.sun_direction = {1, 1, 0}; // shadow falls towards -X
         settings.fog_density = 0.0f;
         settings.shadow_radius = 8.0f;
         for (int i = 0; i < 2; ++i) {
             REQUIRE(world.render_frame(camera, settings, items));
+        }
+        CHECK(world.stats().ray_traced == (ray_tracing && device->info().ray_tracing));
+        if (world.stats().ray_traced) {
+            CHECK(world.stats().rt_instances == 2);
         }
 
         std::vector<u8> rgba;

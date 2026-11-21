@@ -15,4 +15,6 @@ nova_add_module(renderer
 
 nova_add_shader(nova_renderer shaders/forward.slang forward_spv)
 nova_add_shader(nova_renderer shaders/world.slang world_spv)
+# Same source with ray queries: loaded only on devices with DeviceInfo::ray_tracing.
+nova_add_shader(nova_renderer shaders/world.slang world_rt_spv PROFILE spirv_1_4 DEFINES NOVA_RT=1)
 nova_add_shader(nova_renderer shaders/ui.slang ui_spv)

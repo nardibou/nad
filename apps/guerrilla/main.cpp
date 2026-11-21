@@ -288,6 +288,8 @@ int main(int argc, char** argv) {
     bool start_clay_scene = false;
     bool start_hide_ui = false;
     bool force_village = false;
+    bool no_rt = false;
+    u32 rt_view = 0;
     bool has_cam_override = false;
     Vec3 cam_pos_override{0.5f, 0.0f, 9.0f};
     f32 cam_yaw_deg = -90.0f;
@@ -337,6 +339,10 @@ int main(int argc, char** argv) {
             start_hide_ui = true;
         } else if (arg == "--village") {
             force_village = true;
+        } else if (arg == "--no-rt") {
+            no_rt = true; // raster lighting path even on ray-tracing GPUs (A/B comparisons)
+        } else if (arg == "--rt-view" && has_value) {
+            parse_number(argv[++i], rt_view); // 1 shadow, 2 AO, 3 indirect light
         } else if (arg == "--cam" && i + 5 < argc) {
             parse_number(argv[++i], cam_pos_override.x);
             parse_number(argv[++i], cam_pos_override.y);
@@ -952,6 +958,12 @@ int main(int argc, char** argv) {
         settings.ssao_radius = studio.clay_scene ? 0.82f : 0.70f;
         // Disable coarse 1024-texel top-down height-map contact_ao on ultra-smooth Clay GI road (GTAO + 36-tap Bilinear PCSS are cleaner!)
         settings.contact_ao = studio.clay_scene ? 0.0f : 0.70f;
+        settings.rt_indirect = studio.clay_scene ? 0.85f : 1.0f;
+        // Art direction: the golden-hour sun sits in the mountain pass, so only the village itself
+        // shadows it (the far peaks would otherwise eclipse it at this elevation).
+        settings.rt_shadow_distance = studio.clay_scene ? 2000.0f : 120.0f;
+        settings.ray_tracing = !no_rt;
+        settings.rt_debug_view = rt_view;
         {
             const Vec3 sun = math::normalize(settings.sun_direction);
             const Vec3 lf = -sun;
