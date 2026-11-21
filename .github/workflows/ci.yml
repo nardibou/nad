@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  # All branches, so work branches get Windows/Linux/sanitizer results before a PR exists.
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-msvc, os: windows-latest, preset: windows-msvc }
+          - { name: linux-gcc, os: ubuntu-24.04, preset: linux-gcc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Install SDL3 build deps and lavapipe
+        if: runner.os == 'Linux'
+        # lavapipe + validation layers let the GPU tests render for real on a CPU-only runner.
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev mesa-vulkan-drivers vulkan-validationlayers
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DNOVA_WARNINGS_AS_ERRORS=ON
+      - name: Build (Debug)
+        run: cmake --build --preset ${{ matrix.preset }}-debug
+      - name: Test (Debug)
+        run: ctest --preset ${{ matrix.preset }}-debug
+        env:
+          NOVA_REQUIRE_GPU: ${{ runner.os == 'Linux' && '1' || '' }}
+      - name: Build (Release)
+        run: cmake --build --preset ${{ matrix.preset }}-release
+
+  sanitizers:
+    name: sanitizers (${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [thread, "address,undefined"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Configure
+        run: >
+          cmake -S . -B build/san -G Ninja -DCMAKE_BUILD_TYPE=Debug -DNOVA_WITH_SDL3=OFF
+          -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.sanitizer }}"
+      - name: Build
+        run: cmake --build build/san
+      - name: Test
+        run: ctest --test-dir build/san --output-on-failure
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
