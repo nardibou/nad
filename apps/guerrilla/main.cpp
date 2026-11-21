@@ -627,7 +627,6 @@ int main(int argc, char** argv) {
     Stopwatch frame_timer;
     Stopwatch title_timer;
     f32 time = 3.0f;
-    bool first_frame = true;
     std::vector<WorldDrawItem> items;
 
     for (u64 frame = 0; max_frames == 0 || frame < max_frames; ++frame) {
@@ -1128,7 +1127,6 @@ int main(int argc, char** argv) {
         world.render_frame(camera, settings, items, [&](rhi::CommandList& cmd) {
             ui_overlay.render(cmd);
         });
-        first_frame = false;
         if (device->last_gpu_frame_ms() >= 0.0) {
             gpu_stats.record(device->last_gpu_frame_ms());
         }
