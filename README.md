@@ -63,6 +63,18 @@ Other GPUs keep the raster path automatically. Settings are in `WorldSettings` (
 comparisons and `--rt-view 1|2|3` to show the shadow / AO / indirect signals. `NOVA_NO_RT=1` disables it
 globally. Design: [ADR 0009](docs/adr/0009-hybrid-ray-traced-lighting.md).
 
+## Temporal anti-aliasing
+
+`WorldSettings::taa` (on by default, both lighting paths) jitters each frame by a sub-pixel Halton(2,3)
+offset and resolves it into an HDR history. The history is reprojected through the depth buffer with
+closest-depth dilation, fetched with a Catmull-Rom filter, variance-clipped in YCoCg and blended with luma
+weights. It replaces FXAA and the CAS sharpening pass. Against a 2× supersampled reference, edge error is
+about 8% lower than FXAA's on the raster path, and flat surfaces lose the per-pixel shading noise. Guerrilla
+accepts `--no-taa` for A/B comparisons.
+
+Limitation: motion vectors come from the camera only. Objects that move on their own (the first-person
+viewmodel, wind-animated foliage) rely on the variance clip, and the viewmodel skips history entirely.
+
 ## Layout
 
 ```

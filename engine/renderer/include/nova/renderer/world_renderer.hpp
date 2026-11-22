@@ -81,6 +81,8 @@ struct WorldSettings {
     u32 rt_gi_rays = 1;               // GI rays per pixel per frame (1-4), accumulated over time
     bool rt_reflections = true;       // ray-traced water reflections (else screen-space)
     u32 rt_debug_view = 0;            // 0 off, 1 sun shadow, 2 AO, 3 indirect light (denoised signals)
+    // Temporal anti-aliasing (jittered frames + reprojected HDR history); replaces FXAA when on.
+    bool taa = true;
 };
 
 // glTF-style metallic-roughness material for imported assets. Invalid textures fall back to
@@ -194,7 +196,7 @@ private:
     bool valid_ = false;
     bool height_dirty_ = true;
     u64 shadow_hash_ = 0; // PRISM-VSM static shadow cache signature
-    rhi::ShaderHandle shaders_[17]{};
+    rhi::ShaderHandle shaders_[18]{};
     rhi::PipelineHandle shadow_pipeline_;
     rhi::PipelineHandle sky_pipeline_;
     rhi::PipelineHandle main_pipeline_;
@@ -209,6 +211,7 @@ private:
     rhi::PipelineHandle bloom_blur_h_pipeline_;
     rhi::PipelineHandle bloom_blur_v_pipeline_;
     rhi::PipelineHandle post_pipeline_;
+    rhi::PipelineHandle taa_pipeline_;
     rhi::TextureHandle shadow_map_;
     rhi::TextureHandle height_map_;
     rhi::TextureHandle hdr_target_;
@@ -218,6 +221,11 @@ private:
     rhi::TextureHandle lit_target_;
     rhi::TextureHandle bloom_a_;
     rhi::TextureHandle bloom_b_;
+    rhi::TextureHandle taa_history_[2];
+    bool taa_valid_ = false;
+    u32 taa_frame_ = 0;
+    math::Mat4 prev_view_proj_ = math::Mat4::identity(); // unjittered, for reprojection
+    bool prev_valid_ = false;
     rhi::Extent hdr_extent_{};
     std::vector<rhi::BufferHandle> frame_buffers_;
     rhi::BufferHandle height_frame_buffer_;

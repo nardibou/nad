@@ -45,8 +45,9 @@ struct FrameData {
     f32 rt_params[4];  // frame index, sun angular radius, indirect intensity, flags (bits)
     f32 rt_params2[4]; // GI ray length, AO radius, history reset, GI rays per pixel
     f32 rt_params3[4]; // sun shadow ray length
+    f32 taa[4];        // jitter (uv), history valid, enabled
 };
-static_assert(sizeof(FrameData) == 192 + 16 * 16 + 64 + 3 * 16);
+static_assert(sizeof(FrameData) == 192 + 16 * 16 + 64 + 4 * 16);
 
 // RT hit shading reads vertices through shader pointers as floats (world.slang kRtVertexFloats).
 static_assert(sizeof(Vertex) == 64 && offsetof(Vertex, normal) == 12 && offsetof(Vertex, color) == 24,
@@ -79,7 +80,7 @@ void set4(f32 (&dst)[4], const Vec3& v, f32 w) {
 enum ShaderSlot {
     kSkyVS, kSkyFS, kShadowVS, kShadowFS, kMainVS, kMainFS,
     kPostVS, kPostFS, kCompositeFS, kBloomDownFS, kBloomBlurHFS, kBloomBlurVFS,
-    kShadowAssetVS, kShadowAssetFS, kAssetFS, kGiAoFS, kGiAoDenoiseFS,
+    kShadowAssetVS, kShadowAssetFS, kAssetFS, kGiAoFS, kGiAoDenoiseFS, kTaaFS,
     kShaderCount
 };
 constexpr u32 kHeightMapSize = 1024;
@@ -157,7 +158,6 @@ struct WorldRenderer::RtState {
     std::vector<rhi::BufferHandle> instances;  // RtInstanceGpu table per frame in flight
     std::vector<u64> tlas_hash;
     u32 capacity = 0;
-    Mat4 prev_view_proj = Mat4::identity();
     u32 frame = 0;
     bool history_valid = false;
     // Lighting at the last frame: a discontinuous change invalidates the accumulated history.
@@ -194,6 +194,7 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
         {"assetFS", rhi::ShaderStage::Fragment},
         {"giAoFS", rhi::ShaderStage::Fragment},
         {"giAoDenoiseFS", rhi::ShaderStage::Fragment},
+        {"taaFS", rhi::ShaderStage::Fragment},
     };
     for (int i = 0; i < kShaderCount; ++i) {
         shaders_[i] = device_.create_shader({world_spv, entries[i].name, entries[i].stage});
@@ -308,6 +309,12 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
                                  {2, BT::SampledTexture, rhi::Filter::Linear},
                                  {4, BT::SampledTexture, rhi::Filter::Linear}},
                                 rhi::Format::BackBuffer);
+    taa_pipeline_ = fullscreen(kTaaFS,
+                               {frame_binding,
+                                {2, BT::SampledTexture, rhi::Filter::Linear},
+                                {3, BT::SampledTexture, rhi::Filter::Nearest},
+                                {6, BT::SampledTexture, rhi::Filter::Linear}},
+                               kHdrFormat);
 
     shadow_map_ = device_.create_texture({shadow_size_, shadow_size_, rhi::Format::D32_Float, true, true});
     height_map_ = device_.create_texture({kHeightMapSize, kHeightMapSize, rhi::Format::D32_Float, true, true});
@@ -321,7 +328,7 @@ WorldRenderer::WorldRenderer(rhi::Device& device, u32 shadow_map_size)
              asset_shadow_pipeline_.valid() && white_srgb_.valid() && white_linear_.valid() && flat_normal_.valid() &&
              gi_ao_pipeline_.valid() && gi_ao_denoise_pipeline_.valid() &&
              composite_pipeline_.valid() && bloom_down_pipeline_.valid() &&
-             bloom_blur_h_pipeline_.valid() && bloom_blur_v_pipeline_.valid() && post_pipeline_.valid() &&
+             bloom_blur_h_pipeline_.valid() && bloom_blur_v_pipeline_.valid() && post_pipeline_.valid() && taa_pipeline_.valid() &&
              shadow_map_.valid() && height_map_.valid() && height_frame_buffer_.valid() &&
              std::ranges::all_of(frame_buffers_, [](rhi::BufferHandle b) { return b.valid(); });
     if (!valid_) {
@@ -535,14 +542,14 @@ WorldRenderer::~WorldRenderer() {
         device_.destroy(t);
     }
     for (rhi::TextureHandle t : {hdr_target_, scene_depth_, gi_ao_raw_, gi_ao_blur_, lit_target_, bloom_a_, bloom_b_,
-                                 shadow_map_, height_map_, white_srgb_, white_linear_, flat_normal_}) {
+                                 taa_history_[0], taa_history_[1], shadow_map_, height_map_, white_srgb_, white_linear_, flat_normal_}) {
         device_.destroy(t);
     }
     for (rhi::PipelineHandle p : {shadow_pipeline_, sky_pipeline_, main_pipeline_, main_two_sided_pipeline_,
                                   asset_pipeline_, asset_two_sided_pipeline_, asset_shadow_pipeline_,
                                   gi_ao_pipeline_, gi_ao_denoise_pipeline_,
                                   composite_pipeline_, bloom_down_pipeline_, bloom_blur_h_pipeline_,
-                                  bloom_blur_v_pipeline_, post_pipeline_}) {
+                                  bloom_blur_v_pipeline_, post_pipeline_, taa_pipeline_}) {
         device_.destroy(p);
     }
     for (rhi::ShaderHandle s : shaders_) {
@@ -745,7 +752,8 @@ bool WorldRenderer::ensure_targets(rhi::Extent extent) {
     if (hdr_target_.valid() && extent.width == hdr_extent_.width && extent.height == hdr_extent_.height) {
         return true;
     }
-    for (rhi::TextureHandle t : {hdr_target_, scene_depth_, gi_ao_raw_, gi_ao_blur_, lit_target_, bloom_a_, bloom_b_}) {
+    for (rhi::TextureHandle t : {hdr_target_, scene_depth_, gi_ao_raw_, gi_ao_blur_, lit_target_, bloom_a_, bloom_b_,
+                                 taa_history_[0], taa_history_[1]}) {
         device_.destroy(t);
     }
     const u32 qw = std::max(1u, extent.width / 4);
@@ -757,9 +765,14 @@ bool WorldRenderer::ensure_targets(rhi::Extent extent) {
     lit_target_ = device_.create_texture({extent.width, extent.height, kHdrFormat, true, true});
     bloom_a_ = device_.create_texture({qw, qh, kHdrFormat, true, true});
     bloom_b_ = device_.create_texture({qw, qh, kHdrFormat, true, true});
+    taa_history_[0] = device_.create_texture({extent.width, extent.height, kHdrFormat, true, true});
+    taa_history_[1] = device_.create_texture({extent.width, extent.height, kHdrFormat, true, true});
+    taa_valid_ = false;
+    prev_valid_ = false;
     hdr_extent_ = extent;
     return hdr_target_.valid() && scene_depth_.valid() && gi_ao_raw_.valid() && gi_ao_blur_.valid() &&
-           lit_target_.valid() && bloom_a_.valid() && bloom_b_.valid();
+           lit_target_.valid() && bloom_a_.valid() && bloom_b_.valid() && taa_history_[0].valid() &&
+           taa_history_[1].valid();
 }
 
 bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& settings,
@@ -908,7 +921,29 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
     }
 
     FrameData fd{};
-    fd.view_proj = camera.projection(aspect) * camera.view();
+    // TAA: sub-pixel Halton(2,3) jitter applied in clip space; reprojection uses the unjittered matrix.
+    const Mat4 view_proj = camera.projection(aspect) * camera.view();
+    const bool use_taa = settings.taa;
+    f32 jitter_uv[2] = {0.0f, 0.0f};
+    fd.view_proj = view_proj;
+    if (use_taa) {
+        auto halton = [](u32 i, u32 base) {
+            f32 f = 1.0f;
+            f32 acc = 0.0f;
+            for (; i > 0; i /= base) {
+                f /= static_cast<f32>(base);
+                acc += f * static_cast<f32>(i % base);
+            }
+            return acc;
+        };
+        const u32 k = (taa_frame_ % 8u) + 1u;
+        jitter_uv[0] = (halton(k, 2) - 0.5f) / static_cast<f32>(extent.width);
+        jitter_uv[1] = (halton(k, 3) - 0.5f) / static_cast<f32>(extent.height);
+        Mat4 jitter = Mat4::identity();
+        jitter.m[3][0] = jitter_uv[0] * 2.0f; // clip.x += ndc offset * w
+        jitter.m[3][1] = jitter_uv[1] * 2.0f;
+        fd.view_proj = jitter * view_proj;
+    }
     fd.light_view_proj = light_proj * light_view;
     fd.height_view_proj = height_view_proj_;
     set4(fd.camera_pos, camera.position, settings.time);
@@ -929,12 +964,13 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
     set4(fd.point_light, settings.point_light_position, settings.point_light_range);
     set4(fd.point_color, settings.point_light_color, settings.crosshair_px);
     set4(fd.output_size, {static_cast<f32>(output.width), static_cast<f32>(output.height), 0.0f}, 0.0f);
-    fd.prev_view_proj = fd.view_proj;
+    fd.prev_view_proj = prev_valid_ ? prev_view_proj_ : view_proj;
+    fd.taa[0] = jitter_uv[0];
+    fd.taa[1] = jitter_uv[1];
+    fd.taa[2] = use_taa && taa_valid_ ? 1.0f : 0.0f;
+    fd.taa[3] = use_taa ? 1.0f : 0.0f;
     if (use_rt) {
         const RtState& rt = *rt_;
-        if (rt.history_valid) {
-            fd.prev_view_proj = rt.prev_view_proj;
-        }
         const u32 flags = (hybrid_shadows ? kRtFlagHybridShadows : 0u) | (settings.rt_reflections ? kRtFlagReflections : 0u) |
                           ((std::min(settings.rt_debug_view, 3u)) << 2u);
         fd.rt_params[0] = static_cast<f32>(rt.frame % 1024u);
@@ -1245,7 +1281,6 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
                          {3, {}, scene_depth_},
                          {17, {}, {}, rt_->tlas[frame_slot]},
                          {18, rt_->instances[frame_slot], {}}});
-        rt_->prev_view_proj = fd.view_proj;
         rt_->history_valid = true;
         ++rt_->frame;
     } else {
@@ -1259,15 +1294,38 @@ bool WorldRenderer::render_frame(const Camera& camera, const WorldSettings& sett
                         {{1, {}, shadow_map_}, {2, {}, hdr_target_}, {3, {}, scene_depth_}, {4, {}, gi_ao_blur_}});
     }
 
+    // ---- 3.5 TAA resolve into the history ping-pong; everything after reads the resolved image.
+    rhi::TextureHandle resolved = lit_target_;
+    if (use_taa) {
+        const u32 cur = taa_frame_ & 1u;
+        if (!taa_valid_) {
+            rhi::RenderPassDesc pass; // make the unused history shader-readable for its first bind
+            pass.back_buffer = false;
+            pass.color = taa_history_[cur ^ 1u];
+            pass.default_depth = false;
+            cmd->begin_render_pass(pass);
+            cmd->end_render_pass();
+        }
+        fullscreen_pass(taa_history_[cur], taa_pipeline_,
+                        {{2, {}, lit_target_}, {3, {}, scene_depth_}, {6, {}, taa_history_[cur ^ 1u]}});
+        resolved = taa_history_[cur];
+        taa_valid_ = true;
+        ++taa_frame_;
+    } else {
+        taa_valid_ = false;
+    }
+    prev_view_proj_ = view_proj;
+    prev_valid_ = true;
+
     // ---- 4. bloom: 13-tap Jimenez bright pass at quarter resolution + 2x separable 13-tap Gaussian blur
-    fullscreen_pass(bloom_a_, bloom_down_pipeline_, {{6, {}, lit_target_}});
+    fullscreen_pass(bloom_a_, bloom_down_pipeline_, {{6, {}, resolved}});
     for (int pass = 0; pass < 2; ++pass) {
         fullscreen_pass(bloom_b_, bloom_blur_h_pipeline_, {{6, {}, bloom_a_}});
         fullscreen_pass(bloom_a_, bloom_blur_v_pipeline_, {{6, {}, bloom_b_}});
     }
 
     // ---- 5. tonemap + FXAA + CAS + grade into the back buffer
-    fullscreen_pass({}, post_pipeline_, {{2, {}, lit_target_}, {4, {}, bloom_a_}});
+    fullscreen_pass({}, post_pipeline_, {{2, {}, resolved}, {4, {}, bloom_a_}});
 
     // ---- 6. optional crisp native 2K UI & 3D gizmo overlay (NOVA Craft Studio)
     if (overlay) {
