@@ -291,6 +291,7 @@ int main(int argc, char** argv) {
     bool no_rt = false;
     bool no_taa = false;
     u32 rt_view = 0;
+    int sky_preset = -1;
     bool has_cam_override = false;
     Vec3 cam_pos_override{0.5f, 0.0f, 9.0f};
     f32 cam_yaw_deg = -90.0f;
@@ -346,6 +347,8 @@ int main(int argc, char** argv) {
             no_taa = true; // FXAA instead of temporal anti-aliasing (A/B comparisons)
         } else if (arg == "--rt-view" && has_value) {
             parse_number(argv[++i], rt_view); // 1 shadow, 2 AO, 3 indirect light
+        } else if (arg == "--sky" && has_value) {
+            parse_number(argv[++i], sky_preset);
         } else if (arg == "--cam" && i + 5 < argc) {
             parse_number(argv[++i], cam_pos_override.x);
             parse_number(argv[++i], cam_pos_override.y);
@@ -416,6 +419,9 @@ int main(int argc, char** argv) {
     }
     if (start_hide_ui) {
         studio.ui_visible = false;
+    }
+    if (sky_preset >= 0) {
+        studio.apply_sky_preset(sky_preset); // 0 golden, 1 noon, 2 sunset, 3 night
     }
     if (!drop_model_path.empty()) {
         const f32 gy = studio.ground_height_at(0.0f, 0.0f);

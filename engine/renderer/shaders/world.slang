@@ -1724,7 +1724,11 @@ float4 postFS(FullscreenOut input) : SV_Target {
 
     // Triangular dither hides banding in the 8-bit output.
     float noise = hash13(float3(input.position.xy, 1.0)) - hash13(float3(input.position.yx, 2.0));
-    c += noise / 255.0;
+    // Dither in display (sRGB) space: the target encodes our linear output, and +-1/255 added in
+    // linear space would be stretched ~13x by that encode in dark areas (visible night-time grain).
+    float3 enc = c <= 0.0031308 ? c * 12.92 : 1.055 * pow(max(c, 1e-6), 1.0 / 2.4) - 0.055;
+    enc = saturate(enc + noise / 255.0);
+    c = enc <= 0.04045 ? enc / 12.92 : pow((enc + 0.055) / 1.055, 2.4);
     return float4(c, 1.0);
 }
 
